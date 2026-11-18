@@ -56,13 +56,17 @@ where
             ev = rx.recv() => {
                 let Some(ev) = ev else { break };
                 match ev {
-                    Event::Code(c) => {
+                    Event::Code { code: c, browser } => {
                         spinner.suspend(|| {
                             println!();
                             println!("  Wormhole code:  {}", color("1;32", &c));
                             println!();
                             println!("  On the other computer run:");
                             println!("      wormhole send {c} <files…>");
+                            if browser {
+                                println!("  or send from a browser:");
+                                println!("      {}#{c}", crate::mailbox::WEB_URL);
+                            }
                             println!();
                         });
                     }

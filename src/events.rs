@@ -15,8 +15,8 @@ pub struct Summary {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// Receiver: the code to give to the sender.
-    Code(String),
+    /// Receiver: the code to give to the sender, and whether browsers can send too.
+    Code { code: String, browser: bool },
     Status(String),
     Warn(String),
     Connected { peer: SocketAddr, lan: bool },

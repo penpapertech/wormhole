@@ -15,6 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
       - run: cargo build --release
       - name: End-to-end (local mailbox)
@@ -22,12 +23,26 @@ jobs:
       - name: End-to-end (LAN discovery only)
         run: MAILBOX=off tests/local_e2e.sh target/release/wormhole
 
-  nat:
+  browser-and-nat:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            web/spake2-wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: cargo build --release
-      - name: NAT traversal (docker, simulated home routers)
+      - run: web/build.sh
+      - run: npm ci
+        working-directory: tests/browser
+      - name: Browser → CLI (Chromium in docker)
+        run: node tests/browser/browser_e2e.mjs target/release/wormhole
+      - name: NAT traversal incl. browser behind NAT (docker, simulated home routers)
         run: tests/nat/run.sh target/release/wormhole

@@ -41,7 +41,7 @@ pub struct Prepared {
     pub candidates: Vec<SocketAddr>,
 }
 
-fn bind_socket() -> Result<std::net::UdpSocket> {
+pub(crate) fn bind_socket() -> Result<std::net::UdpSocket> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     s.set_broadcast(true)?;
     s.set_nonblocking(true)?;
@@ -51,12 +51,13 @@ fn bind_socket() -> Result<std::net::UdpSocket> {
     Ok(s.into())
 }
 
-struct Iface {
-    ip: Ipv4Addr,
-    broadcast: Option<Ipv4Addr>,
+pub(crate) struct Iface {
+    pub ip: Ipv4Addr,
+    pub broadcast: Option<Ipv4Addr>,
+    pub netmask: Ipv4Addr,
 }
 
-fn interfaces() -> Vec<Iface> {
+pub(crate) fn interfaces() -> Vec<Iface> {
     let mut out = Vec::new();
     if let Ok(list) = if_addrs::get_if_addrs() {
         for i in list {
@@ -64,7 +65,7 @@ fn interfaces() -> Vec<Iface> {
                 if v4.ip.is_loopback() || v4.ip.is_link_local() {
                     continue;
                 }
-                out.push(Iface { ip: v4.ip, broadcast: v4.broadcast });
+                out.push(Iface { ip: v4.ip, broadcast: v4.broadcast, netmask: v4.netmask });
             }
         }
     }
@@ -106,7 +107,40 @@ pub async fn prepare(tx: &Tx, use_stun: bool) -> Result<Prepared> {
 }
 
 fn info(candidates: &[SocketAddr]) -> PeerInfo {
-    PeerInfo { v: 1, addrs: candidates.iter().map(|a| a.to_string()).collect() }
+    PeerInfo { v: 1, addrs: candidates.iter().map(|a| a.to_string()).collect(), webrtc: None }
+}
+
+/// Aborts the wrapped task when dropped.
+pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Receiver: poll the mailbox for the sender's info (addresses and/or WebRTC answer).
+pub fn spawn_sender_poller(mb: Mailbox, np: u32) -> (watch::Receiver<Option<PeerInfo>>, AbortOnDrop) {
+    let (tx, rx) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        let started = Instant::now();
+        loop {
+            if let Ok(Some((_, Some(s)))) = mb.get(np).await {
+                tx.send_if_modified(|cur| {
+                    if cur.as_ref() == Some(&s) {
+                        false
+                    } else {
+                        *cur = Some(s);
+                        true
+                    }
+                });
+            }
+            // Poll quickly at first, then back off to keep the mailbox cheap.
+            let secs = if started.elapsed() < Duration::from_secs(120) { 1 } else { 3 };
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+        }
+    });
+    (rx, AbortOnDrop(task))
 }
 
 fn parse_addrs(info: &PeerInfo) -> Vec<SocketAddr> {
@@ -121,7 +155,7 @@ fn packet(kind: &[u8; 4], tag: &[u8; 16]) -> [u8; 20] {
 }
 
 /// True if `a` is on the same subnet as one of our interfaces (i.e. no router in between).
-fn is_lan_addr(a: &SocketAddr) -> bool {
+pub(crate) fn is_lan_addr(a: &SocketAddr) -> bool {
     let IpAddr::V4(ip) = a.ip() else { return false };
     if ip.is_loopback() {
         return true;
@@ -139,8 +173,14 @@ fn is_lan_addr(a: &SocketAddr) -> bool {
 }
 
 /// Receiver side: claim a nameplate and return the code to show the user.
-pub async fn claim_code(prep: &Prepared, mailbox: Option<&Mailbox>, tx: &Tx) -> Result<(Code, bool)> {
-    let pi = info(&prep.candidates);
+pub async fn claim_code(
+    prep: &Prepared,
+    webrtc_offer: Option<String>,
+    mailbox: Option<&Mailbox>,
+    tx: &Tx,
+) -> Result<(Code, bool)> {
+    let mut pi = info(&prep.candidates);
+    pi.webrtc = webrtc_offer;
     if let Some(mb) = mailbox {
         status(tx, "Registering with the rendezvous mailbox…");
         let mut digits = 999u32;
@@ -200,7 +240,7 @@ async fn lan_responder(listener: UdpSocket, main: Arc<UdpSocket>, lan_id: [u8; 1
 pub async fn receiver_connect(
     prep: Prepared,
     code: &Code,
-    mailbox: Option<Mailbox>,
+    sender_info: Option<watch::Receiver<Option<PeerInfo>>>,
     tx: &Tx,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let sock = Arc::new(prep.sock);
@@ -215,26 +255,12 @@ pub async fn receiver_connect(
             None
         }
     };
-
-    let (cand_tx, cand_rx) = watch::channel(Vec::<SocketAddr>::new());
-    let np = code.nameplate;
-    let poll_task = mailbox.map(|mb| {
-        tokio::spawn(async move {
-            let mut last: Option<Vec<String>> = None;
-            let started = Instant::now();
-            loop {
-                if let Ok(Some((_, Some(s)))) = mb.get(np).await {
-                    if last.as_ref() != Some(&s.addrs) {
-                        last = Some(s.addrs.clone());
-                        let _ = cand_tx.send(parse_addrs(&s));
-                    }
-                }
-                // Poll quickly at first, then back off to keep the mailbox cheap.
-                let secs = if started.elapsed() < Duration::from_secs(120) { 1 } else { 3 };
-                tokio::time::sleep(Duration::from_secs(secs)).await;
-            }
-        })
-    });
+    let sender_addrs = || -> Vec<SocketAddr> {
+        sender_info
+            .as_ref()
+            .and_then(|r| r.borrow().as_ref().map(parse_addrs))
+            .unwrap_or_default()
+    };
 
     let result = async {
         let deadline = tokio::time::sleep(RECEIVER_WAIT);
@@ -246,7 +272,7 @@ pub async fn receiver_connect(
             tokio::select! {
                 _ = &mut deadline => bail!("timed out waiting for a sender (code expired)"),
                 _ = tick.tick() => {
-                    let c = cand_rx.borrow().clone();
+                    let c = sender_addrs();
                     if !c.is_empty() && !announced {
                         announced = true;
                         status(tx, "Sender found, establishing a direct connection…");
@@ -274,10 +300,6 @@ pub async fn receiver_connect(
     .await;
 
     if let Some(t) = lan_task {
-        t.abort();
-        let _ = t.await;
-    }
-    if let Some(t) = poll_task {
         t.abort();
         let _ = t.await;
     }

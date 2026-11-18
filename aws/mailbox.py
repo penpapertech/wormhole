@@ -4,8 +4,9 @@ Runs as an AWS Lambda function (function URL + DynamoDB), or locally for testing
 
     python3 mailbox.py --serve 8080        # in-memory store, http://127.0.0.1:8080/
 
-The mailbox only stores, for a few minutes, the candidate IP:port addresses each peer posts
-under a numeric nameplate. It never sees the secret code words nor any file data.
+The mailbox only stores, for a few minutes, what each peer posts under a numeric nameplate: its
+candidate IP:port addresses and, for browser senders, a WebRTC offer/answer (SDP). It never sees
+the secret code words nor any file data.
 
 API (POST JSON):
   {"op":"claim","np":"42","data":"..."}         receiver opens nameplate 42 (409 if taken)
@@ -22,7 +23,7 @@ import time
 
 TABLE = os.environ.get("TABLE", "wormhole-mailbox")
 TTL_SECONDS = int(os.environ.get("TTL_SECONDS", "1800"))
-MAX_DATA = 4096
+MAX_DATA = 16384  # room for a WebRTC offer/answer (SDP) next to the addresses
 NP_RE = re.compile(r"^[1-9][0-9]{0,5}$")
 
 
@@ -159,7 +160,7 @@ def handler(event, context):
     if event.get("requestContext", {}).get("http", {}).get("method") != "POST":
         return _respond(405, {"error": "POST only"})
     body = event.get("body") or ""
-    if len(body) > 16384:
+    if len(body) > 65536:
         return _respond(413, {"error": "too large"})
     try:
         if event.get("isBase64Encoded"):
@@ -177,6 +178,16 @@ def serve(port):
     store = MemoryStore()
 
     class H(BaseHTTPRequestHandler):
+        def cors(self):
+            self.send_header("access-control-allow-origin", "*")
+            self.send_header("access-control-allow-methods", "POST")
+            self.send_header("access-control-allow-headers", "content-type")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.cors()
+            self.end_headers()
+
         def do_POST(self):
             n = int(self.headers.get("content-length", "0"))
             try:
@@ -189,6 +200,7 @@ def serve(port):
             self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(raw)))
+            self.cors()
             self.end_headers()
             self.wfile.write(raw)
 

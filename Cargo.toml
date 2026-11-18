@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1.1.11"
 hmac = "0.12"
 if-addrs = "0.13"
 indicatif = "0.17"
@@ -29,6 +30,7 @@ sha2 = "0.10"
 shell-words = "1"
 socket2 = { version = "0.5", features = ["all"] }
 spake2 = "0.4"
+str0m = { version = "0.25", default-features = false, features = ["rust-crypto"] }
 tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }

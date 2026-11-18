@@ -8,6 +8,8 @@ computer A $ wormhole receive
   Wormhole code:  42-maple-sunset
   On the other computer run:
       wormhole send 42-maple-sunset <files…>
+  or send from a browser:
+      https://andykcheng.github.io/wormhole/#42-maple-sunset
 
 computer B $ wormhole send 42-maple-sunset -R *
   Connected to 81.2.69.160:52811 (direct over the internet)
@@ -29,6 +31,10 @@ computer B $ wormhole send 42-maple-sunset -R *
   and a failed guess aborts the transfer.
 - **TUI or CLI.** Run `wormhole` with no arguments for an interactive UI where you can drag and
   drop files onto the terminal window, or script it with `receive` and `send`.
+- **Send from a browser.** Any `wormhole receive` (a laptop or a headless server) also accepts
+  files from the [web sender](https://andykcheng.github.io/wormhole/), with no install on the
+  sending side. Drag files or whole folders into the page, type the code, and the data goes peer
+  to peer over WebRTC.
 
 ## Install
 
@@ -51,12 +57,15 @@ The first time it runs, macOS may also ask to allow your terminal to access the 
 | `wormhole receive` (`r`) | Print a code, wait, save into the current folder (`-o DIR` to choose) |
 | `wormhole send CODE FILE…` (`s`) | Send files; add `-R` for folders, e.g. `wormhole send CODE -R *` |
 | `wormhole send CODE` | Open the TUI send screen with the code filled in, then drop files |
+| [web sender](https://andykcheng.github.io/wormhole/) | Send from any browser to a `wormhole receive` |
 
 Options and environment variables:
 
 - `--mailbox URL` / `WORMHOLE_MAILBOX` sets a different rendezvous mailbox. Use `off` for LAN only.
 - `WORMHOLE_STUN=host:port,…` sets the STUN servers (default: Google and Cloudflare).
 - `WORMHOLE_ZSTD_LEVEL` sets the compression level (default 3, range 1–19).
+- `wormhole receive --no-webrtc` doesn't offer the browser transport.
+- The web page accepts `?mailbox=URL` and `?stun=host:port` for self-hosting.
 
 ## How it works
 
@@ -86,8 +95,38 @@ Options and environment variables:
 6. The sender streams `tar | zstd` over a QUIC stream. The receiver decompresses and extracts as
    data arrives, rejects unsafe paths (`..`, absolute paths, links), and confirms.
 
-**What the mailbox sees:** the nameplate number and the IP:port candidates, for a few minutes. It
-never sees the code words, the key or any file data.
+**What the mailbox sees:** the nameplate number, the IP:port candidates and the WebRTC offer and
+answer (which contain the same addresses), for a few minutes. It never sees the code words, the
+key or any file data.
+
+### Browser senders (WebRTC)
+
+A browser can't open raw UDP sockets, so the receiver listens on **two transports at once** and
+uses whichever sender authenticates first:
+
+```
+ wormhole receive                                mailbox                     sender
+   ├─ QUIC socket: STUN + addresses ─────┐
+   ├─ WebRTC: offer (SDP + ICE cands) ───┴──► claim 42 ──► wormhole CLI: addrs → QUIC (above)
+   │                                                   └─► browser: reads offer → posts answer
+   │◄════════ ICE (STUN, hole punching) + DTLS + SCTP data channel ═══════════════════►│
+   │◄════════ SPAKE2(code) + HMAC over both DTLS fingerprints ════════════════════════►│
+   │◄════════ tar | gzip (the browser's built-in CompressionStream), extracted on the fly ══│
+```
+
+- The receiver creates its WebRTC offer up front and posts it next to its QUIC addresses, so a
+  browser needs only one round trip: it reads the offer and posts an answer.
+- The CLI side uses [str0m](https://github.com/algesten/str0m) with pure-Rust crypto, so the
+  binary stays self-contained.
+- The page runs the **same SPAKE2 crate** compiled to WebAssembly (`web/spake2-wasm`, 48 KB). The
+  HMAC confirmation covers both DTLS certificate fingerprints, so swapping the offer or answer in
+  the mailbox can't be used to sit in the middle.
+- The page is static (`web/public`), hosted on GitHub Pages, and never touches file data.
+- **Speed:** WebRTC data channels are slower than QUIC. The browser → CLI test reaches about
+  50 MB/s on one machine, limited by the browser's gzip, versus several hundred MB/s for CLI ↔ CLI.
+  Over the internet, both are usually limited by the connection itself.
+- **Browsers:** tested with Chromium. Firefox (113+) and Safari (16.4+) have every API used, but
+  haven't been tested yet. Browsers can send but not receive yet.
 
 ### Limitations
 
@@ -99,8 +138,9 @@ never sees the code words, the key or any file data.
 
 ## Running your own mailbox
 
-The mailbox is a ~150-line Python Lambda (`aws/mailbox.py`) with a public function URL and a
-DynamoDB table with TTL. To deploy it to your AWS account (idempotent):
+The mailbox is a ~200-line Python Lambda (`aws/mailbox.py`) with a public function URL (CORS
+enabled for the web sender) and a DynamoDB table with TTL. To deploy it to your AWS account
+(idempotent):
 
 ```sh
 aws/deploy.sh                       # prints the mailbox URL
@@ -122,13 +162,18 @@ cargo test                               # unit tests (codes, STUN parsing, tar/
 tests/local_e2e.sh                       # two processes on one machine, local mailbox, 300+ files
 MAILBOX=off tests/local_e2e.sh           # LAN discovery only
 python3 tests/tui_smoke.py target/release/wormhole   # drives the TUI through a pty (paste/drop, send & receive)
+
+web/build.sh && (cd tests/browser && npm install)    # once, for the browser tests
+node tests/browser/browser_e2e.mjs       # headless Chromium (in docker) → CLI: folders, long/unicode names, UI, wrong code, throughput
+MAILBOX_URL=<deployed url> node tests/browser/browser_e2e.mjs   # same, against a real mailbox
 tests/nat/run.sh                         # Docker: peers behind simulated home-router NATs (needs docker)
 ```
 
 The NAT test builds this topology inside one privileged container using network namespaces. The
 routers use Linux `MASQUERADE` and drop unsolicited inbound packets, like a typical home router.
-It checks: cone↔cone in both directions (hole punching), same LAN, LAN-only without a mailbox, and
-that symmetric-NAT cases fail cleanly.
+It checks: cone↔cone in both directions (hole punching), same LAN, LAN-only without a mailbox,
+**a browser behind one NAT sending to a CLI behind another** (WebRTC), and that symmetric-NAT
+cases fail cleanly.
 
 ## License
 

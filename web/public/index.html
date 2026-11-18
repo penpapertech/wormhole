@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wormhole — send files</title>
+<meta name="description" content="Send files and folders peer-to-peer to a computer running `wormhole receive`.">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #667085; --line: #e4e7ec;
+    --accent: #0e7490; --accent-soft: #e0f2f7; --ok: #15803d; --err: #b42318; --warn: #b54708;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1215; --card: #171b20; --text: #e6e8eb; --muted: #98a2b3; --line: #2a3038;
+      --accent: #22b8cf; --accent-soft: #10303a; --ok: #4ade80; --err: #f97066; --warn: #fdb022;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 20px; }
+  header h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  header span { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 14px; }
+  label.field { display: block; font-weight: 600; margin-bottom: 8px; }
+  input#code { width: 100%; font: 600 20px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 12px 14px;
+               border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); }
+  input#code:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em;
+         background: var(--accent-soft); padding: 1px 5px; border-radius: 5px; }
+  #drop { border: 2px dashed var(--line); border-radius: 12px; padding: 26px 16px; text-align: center; transition: .15s; }
+  #drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  #drop p { margin: 0 0 12px; color: var(--muted); }
+  button { font: inherit; border-radius: 9px; border: 1px solid var(--line); background: var(--card); color: var(--text);
+           padding: 8px 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: transparent; font-weight: 600; width: 100%; padding: 12px; font-size: 16px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  ul#list { list-style: none; margin: 14px 0 0; padding: 0; }
+  ul#list li { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-top: 1px solid var(--line); }
+  ul#list li .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ul#list li .meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  ul#list li button { padding: 2px 9px; }
+  .totals { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  #status { min-height: 22px; }
+  .bar { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 10px 0 6px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  .ok { color: var(--ok); } .err { color: var(--err); } .muted { color: var(--muted); }
+  footer { color: var(--muted); font-size: 13px; margin-top: 22px; }
+  footer a { color: var(--accent); }
+  @media (max-width: 480px) { main { padding-top: 20px; } input#code { font-size: 18px; } }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>wormhole</h1><span>send files peer-to-peer</span></header>
+
+  <section class="card">
+    <label class="field" for="code">Code from the receiver</label>
+    <input id="code" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="7-purple-sausage">
+    <div class="hint">On the receiving computer run <code>wormhole receive</code> and type the code it shows.</div>
+  </section>
+
+  <section class="card">
+    <div id="drop">
+      <p>Drop files or folders here</p>
+      <button id="pickFiles" type="button">Choose files</button>
+      <button id="pickDir" type="button">Choose folder</button>
+      <input id="files" type="file" multiple hidden>
+      <input id="dir" type="file" webkitdirectory hidden>
+    </div>
+    <ul id="list"></ul>
+    <div class="totals" id="totals"></div>
+  </section>
+
+  <section class="card">
+    <button class="primary" id="send" disabled>Send</button>
+    <div id="progress" hidden>
+      <div class="bar"><div id="fill"></div></div>
+      <div class="muted" id="pmeta"></div>
+    </div>
+    <div id="status" class="muted"></div>
+  </section>
+
+  <footer>
+    Files travel directly between the two computers over an encrypted WebRTC connection; the
+    rendezvous server only helps them find each other. <a href="https://github.com/andykcheng/wormhole">Source &amp; CLI</a>
+  </footer>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>

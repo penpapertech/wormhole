@@ -1,2 +1,7 @@
 /target
 *.zip
+node_modules/
+tests/browser/.ui-tmp-*
+web/spake2-wasm/target
+web/public/spake2.wasm
+__pycache__/

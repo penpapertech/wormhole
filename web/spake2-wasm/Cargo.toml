@@ -1,0 +1,22 @@
+[package]
+name = "wormhole-spake2-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "SPAKE2 for the wormhole web sender (same crate as the CLI, so codes are compatible)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spake2 = { version = "0.4", default-features = false }
+rand_chacha = "0.3"
+rand_core = "0.6"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+
+[workspace]

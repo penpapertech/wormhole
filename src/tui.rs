@@ -40,6 +40,7 @@ enum Focus {
 struct Run {
     receiving: bool,
     code: Option<String>,
+    browser: bool,
     status: String,
     log: Vec<(bool, String)>,
     connected: Option<String>,
@@ -175,6 +176,7 @@ impl App {
         self.run = Some(Run {
             receiving,
             code: if receiving { None } else { Some(self.code_input.trim().to_string()) },
+            browser: false,
             status: "Starting…".into(),
             log: vec![],
             connected: None,
@@ -192,7 +194,10 @@ impl App {
         let Some(run) = &mut self.run else { return };
         while let Ok(ev) = run.rx.try_recv() {
             match ev {
-                Event::Code(c) => run.code = Some(c),
+                Event::Code { code, browser } => {
+                    run.code = Some(code);
+                    run.browser = browser;
+                }
                 Event::Status(s) => run.status = s,
                 Event::Warn(w) => run.log.push((true, w)),
                 Event::Connected { peer, lan } => {
@@ -491,7 +496,7 @@ impl App {
         let Some(run) = &self.run else { return };
         let area = center(area, 90, area.height);
         let [code_a, info_a, gauge_a, log_a] = Layout::vertical([
-            Constraint::Length(if run.receiving { 6 } else { 3 }),
+            Constraint::Length(if run.receiving { if run.browser { 8 } else { 6 } } else { 3 }),
             Constraint::Length(5),
             Constraint::Length(3),
             Constraint::Min(2),
@@ -504,6 +509,10 @@ impl App {
             lines.push(Line::raw(""));
             lines.push(Line::from("On the other computer run:").dim().alignment(Alignment::Center));
             lines.push(Line::from(format!("wormhole send {code} <files…>")).alignment(Alignment::Center));
+            if run.browser {
+                lines.push(Line::from("or from a browser:").dim().alignment(Alignment::Center));
+                lines.push(Line::from(format!("{}#{code}", crate::mailbox::WEB_URL)).alignment(Alignment::Center));
+            }
         }
         f.render_widget(
             Paragraph::new(lines).block(

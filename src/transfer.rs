@@ -24,10 +24,13 @@ pub struct Offer {
     pub bytes: u64,
     /// Expected size of the uncompressed tar stream (for progress).
     pub tar_bytes: u64,
+    /// Compression of the data stream: "zstd" (default, CLI), "gzip" (browsers) or "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Answer {
+pub(crate) struct Answer {
     ok: bool,
     error: Option<String>,
     #[serde(default)]
@@ -129,7 +132,7 @@ pub fn plan(paths: &[PathBuf], recursive: bool) -> Result<Plan> {
             }
         }
     }
-    Ok(Plan { entries, offer: Offer { names, files, dirs, bytes, tar_bytes }, skipped })
+    Ok(Plan { entries, offer: Offer { names, files, dirs, bytes, tar_bytes, encoding: None }, skipped })
 }
 
 /// `Write` adapter that ships chunks to an async task.
@@ -300,13 +303,23 @@ fn valid_top_name(n: &str) -> bool {
         && matches!(p.components().next(), Some(Component::Normal(_)))
 }
 
+fn decoder<'a, R: Read + 'a>(encoding: &str, r: R) -> Result<Box<dyn Read + 'a>> {
+    Ok(match encoding {
+        "zstd" => Box::new(zstd::Decoder::new(r)?),
+        "gzip" => Box::new(flate2::read::MultiGzDecoder::new(io::BufReader::new(r))),
+        "none" => Box::new(r),
+        other => bail!("unsupported encoding '{other}'"),
+    })
+}
+
 pub fn extract<R: Read>(
     r: R,
+    encoding: &str,
     dest: &Path,
     renames: &HashMap<String, String>,
     progress: Arc<AtomicU64>,
 ) -> Result<(u64, u64, u64)> {
-    let dec = zstd::Decoder::new(r)?;
+    let dec = decoder(encoding, r)?;
     let mut ar = tar::Archive::new(Counting { inner: dec, n: progress });
     let (mut files, mut bytes, mut skipped) = (0u64, 0u64, 0u64);
     for entry in ar.entries()? {
@@ -347,18 +360,14 @@ pub fn extract<R: Read>(
     Ok((files, bytes, skipped))
 }
 
-pub async fn receive(
-    conn: &Connection,
-    ctrl_send: &mut SendStream,
-    ctrl_recv: &mut RecvStream,
-    dest: &Path,
-    tx: &Tx,
-) -> Result<Summary> {
-    let offer: Offer = read_json(ctrl_recv).await?;
+/// Validate an incoming offer and decide the final top-level names (never overwrite).
+pub(crate) fn plan_receive(offer: &Offer, dest: &Path, tx: &Tx) -> Result<(HashMap<String, String>, Vec<String>)> {
     if let Some(bad) = offer.names.iter().find(|n| !valid_top_name(n)) {
-        let msg = format!("unsafe name in offer: {bad:?}");
-        write_json(ctrl_send, &Answer { ok: false, error: Some(msg.clone()), saved: vec![] }).await?;
-        bail!(msg);
+        bail!("unsafe name in offer: {bad:?}");
+    }
+    match offer.encoding.as_deref().unwrap_or("zstd") {
+        "zstd" | "gzip" | "none" => {}
+        other => bail!("unsupported encoding '{other}'"),
     }
     fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut renames = HashMap::new();
@@ -371,18 +380,65 @@ pub async fn receive(
         saved.push(u.clone());
         renames.insert(n.clone(), u);
     }
+    Ok((renames, saved))
+}
+
+type Extractor = tokio::task::JoinHandle<Result<(u64, u64, u64)>>;
+
+/// Start extracting in a blocking thread; feed it chunks through the returned sender.
+pub(crate) fn spawn_extractor(
+    offer: &Offer,
+    dest: &Path,
+    renames: HashMap<String, String>,
+    progress: Arc<AtomicU64>,
+) -> (mpsc::Sender<bytes::Bytes>, Extractor) {
+    let (chunk_tx, chunk_rx) = mpsc::channel::<bytes::Bytes>(16);
+    let dest = dest.to_path_buf();
+    let encoding = offer.encoding.clone().unwrap_or_else(|| "zstd".into());
+    let handle = tokio::task::spawn_blocking(move || {
+        extract(ChanReader { rx: chunk_rx, cur: bytes::Bytes::new() }, &encoding, &dest, &renames, progress)
+    });
+    (chunk_tx, handle)
+}
+
+fn finish_summary(
+    tx: &Tx,
+    offer: &Offer,
+    r: (u64, u64, u64),
+    wire: u64,
+    start: Instant,
+    saved: Vec<String>,
+) -> Summary {
+    let (files, bytes, skipped) = r;
+    if skipped > 0 {
+        warn(tx, format!("skipped {skipped} special entries (links/devices)"));
+    }
+    emit(tx, Event::Progress { done: offer.tar_bytes, total: offer.tar_bytes });
+    Summary { files, bytes, wire_bytes: wire, secs: start.elapsed().as_secs_f64(), names: saved }
+}
+
+pub async fn receive(
+    conn: &Connection,
+    ctrl_send: &mut SendStream,
+    ctrl_recv: &mut RecvStream,
+    dest: &Path,
+    tx: &Tx,
+) -> Result<Summary> {
+    let offer: Offer = read_json(ctrl_recv).await?;
+    let (renames, saved) = match plan_receive(&offer, dest, tx) {
+        Ok(x) => x,
+        Err(e) => {
+            write_json(ctrl_send, &Answer { ok: false, error: Some(e.to_string()), saved: vec![] }).await?;
+            return Err(e);
+        }
+    };
     emit(tx, Event::Offer(offer.clone()));
     write_json(ctrl_send, &Answer { ok: true, error: None, saved: vec![] }).await?;
 
     let start = Instant::now();
     let mut data = conn.accept_uni().await.context("waiting for data stream")?;
     let progress = Arc::new(AtomicU64::new(0));
-    let (chunk_tx, chunk_rx) = mpsc::channel::<bytes::Bytes>(16);
-    let p2 = progress.clone();
-    let dest2 = dest.to_path_buf();
-    let extractor = tokio::task::spawn_blocking(move || {
-        extract(ChanReader { rx: chunk_rx, cur: bytes::Bytes::new() }, &dest2, &renames, p2)
-    });
+    let (chunk_tx, extractor) = spawn_extractor(&offer, dest, renames, progress.clone());
 
     let mut wire = 0u64;
     let mut last = Instant::now();
@@ -414,16 +470,84 @@ pub async fn receive(
         (Ok(_), Some(e)) => Err(anyhow::Error::from(e).context("connection lost")),
     };
     match result {
-        Ok((files, bytes, skipped)) => {
-            if skipped > 0 {
-                warn(tx, format!("skipped {skipped} special entries (links/devices)"));
-            }
-            emit(tx, Event::Progress { done: offer.tar_bytes, total: offer.tar_bytes });
+        Ok(r) => {
             write_json(ctrl_send, &Answer { ok: true, error: None, saved: saved.clone() }).await?;
-            Ok(Summary { files, bytes, wire_bytes: wire, secs: start.elapsed().as_secs_f64(), names: saved })
+            Ok(finish_summary(tx, &offer, r, wire, start, saved))
         }
         Err(e) => {
             let _ = write_json(ctrl_send, &Answer { ok: false, error: Some(format!("{e:#}")), saved: vec![] }).await;
+            Err(e)
+        }
+    }
+}
+
+/// Receive over a WebRTC data channel from a browser. Messages: text JSON offer → text JSON
+/// answer → binary data chunks → text `{"done":true}` → text JSON answer.
+pub async fn receive_dc(conn: &mut crate::webrtc::DcConn, dest: &Path, tx: &Tx) -> Result<Summary> {
+    let m = conn.recv().await?;
+    if m.binary {
+        bail!("protocol error: expected the file offer");
+    }
+    let offer: Offer = serde_json::from_slice(&m.data).context("protocol error: bad offer")?;
+    let (renames, saved) = match plan_receive(&offer, dest, tx) {
+        Ok(x) => x,
+        Err(e) => {
+            let a = Answer { ok: false, error: Some(e.to_string()), saved: vec![] };
+            conn.send_text(&serde_json::to_string(&a)?).await?;
+            return Err(e);
+        }
+    };
+    emit(tx, Event::Offer(offer.clone()));
+    conn.send_text(&serde_json::to_string(&Answer { ok: true, error: None, saved: vec![] })?).await?;
+
+    let start = Instant::now();
+    let progress = Arc::new(AtomicU64::new(0));
+    let (chunk_tx, extractor) = spawn_extractor(&offer, dest, renames, progress.clone());
+    let mut wire = 0u64;
+    let mut last = Instant::now();
+    let mut net_err = None;
+    loop {
+        match conn.recv().await {
+            Ok(m) if m.binary => {
+                wire += m.data.len() as u64;
+                if chunk_tx.send(bytes::Bytes::from(m.data)).await.is_err() {
+                    break;
+                }
+            }
+            Ok(m) => {
+                let v: serde_json::Value = serde_json::from_slice(&m.data).unwrap_or_default();
+                if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
+                    break;
+                }
+                net_err = Some(anyhow::anyhow!("sender aborted: {}", String::from_utf8_lossy(&m.data)));
+                break;
+            }
+            Err(e) => {
+                net_err = Some(e);
+                break;
+            }
+        }
+        if last.elapsed() > Duration::from_millis(100) {
+            last = Instant::now();
+            emit(tx, Event::Progress { done: progress.load(Ordering::Relaxed), total: offer.tar_bytes });
+        }
+    }
+    drop(chunk_tx);
+    let result = extractor.await.context("extractor task")?;
+    let result = match (result, net_err) {
+        (Ok(r), None) => Ok(r),
+        (Err(e), _) => Err(e),
+        (Ok(_), Some(e)) => Err(e),
+    };
+    match result {
+        Ok(r) => {
+            let a = Answer { ok: true, error: None, saved: saved.clone() };
+            conn.send_text(&serde_json::to_string(&a)?).await?;
+            Ok(finish_summary(tx, &offer, r, wire, start, saved))
+        }
+        Err(e) => {
+            let a = Answer { ok: false, error: Some(format!("{e:#}")), saved: vec![] };
+            let _ = conn.send_text(&serde_json::to_string(&a)?).await;
             Err(e)
         }
     }
@@ -471,7 +595,7 @@ mod tests {
             renames.insert(n.clone(), unique_name(&dst, n));
         }
         let prog = Arc::new(AtomicU64::new(0));
-        let (files, bytes, _) = extract(&compressed[..], &dst, &renames, prog.clone()).unwrap();
+        let (files, bytes, _) = extract(&compressed[..], "zstd", &dst, &renames, prog.clone()).unwrap();
         assert_eq!(files, 3);
         assert_eq!(bytes, 100_008);
         assert_eq!(fs::read_to_string(dst.join("dir/a.txt")).unwrap(), "hello");
@@ -509,7 +633,7 @@ mod tests {
         let dst = tmpdir("trav");
         let mut renames = HashMap::new();
         renames.insert("..".to_string(), "x".to_string());
-        assert!(extract(&compressed[..], &dst, &renames, Arc::new(AtomicU64::new(0))).is_err());
+        assert!(extract(&compressed[..], "zstd", &dst, &renames, Arc::new(AtomicU64::new(0))).is_err());
         assert!(!dst.parent().unwrap().join("evil.x").exists());
         fs::remove_dir_all(dst).unwrap();
     }

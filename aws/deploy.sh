@@ -72,8 +72,12 @@ aws logs create-log-group --log-group-name "/aws/lambda/$NAME" 2>/dev/null || tr
 aws logs put-retention-policy --log-group-name "/aws/lambda/$NAME" --retention-in-days 3
 
 # --- Public function URL ----------------------------------------------------------------------
+# CORS lets the web sender (a static page on any origin) call the mailbox from the browser.
+CORS='AllowOrigins=*,AllowMethods=POST,AllowHeaders=content-type,MaxAge=86400'
 if ! aws lambda get-function-url-config --function-name "$NAME" >/dev/null 2>&1; then
-  aws lambda create-function-url-config --function-name "$NAME" --auth-type NONE >/dev/null
+  aws lambda create-function-url-config --function-name "$NAME" --auth-type NONE --cors "$CORS" >/dev/null
+else
+  aws lambda update-function-url-config --function-name "$NAME" --cors "$CORS" >/dev/null
 fi
 aws lambda add-permission --function-name "$NAME" --statement-id public-url \
   --action lambda:InvokeFunctionUrl --principal "*" --function-url-auth-type NONE >/dev/null 2>&1 || true

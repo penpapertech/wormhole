@@ -83,3 +83,27 @@ pub async fn authenticate(
     }
     Ok(())
 }
+
+/// Receiver side of the same handshake over a WebRTC data channel (browser senders). The binding
+/// value is a hash of both DTLS fingerprints instead of the TLS exporter.
+pub async fn authenticate_dc(conn: &mut crate::webrtc::DcConn, code: &Code) -> Result<()> {
+    let expect_binary = |m: crate::webrtc::Msg| -> Result<Vec<u8>> {
+        if !m.binary {
+            bail!("protocol error: expected a binary message");
+        }
+        Ok(m.data)
+    };
+    let (state, msg) = Spake2::<Ed25519Group>::start_symmetric(
+        &Password::new(code.password()),
+        &Identity::new(b"wormhole-v1"),
+    );
+    let peer_msg = expect_binary(conn.recv().await?)?;
+    conn.send(true, msg).await?;
+    let key = state.finish(&peer_msg).map_err(|_| anyhow!(WRONG_CODE))?;
+    let binding = conn.binding;
+    let t = expect_binary(conn.recv().await?)?;
+    mac(&key, b"sender", &binding).verify_slice(&t).map_err(|_| anyhow!(WRONG_CODE))?;
+    let tag = mac(&key, b"receiver", &binding).finalize().into_bytes().to_vec();
+    conn.send(true, tag).await?;
+    Ok(())
+}

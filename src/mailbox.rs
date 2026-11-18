@@ -1,6 +1,6 @@
 //! Client for the rendezvous mailbox (an AWS Lambda function URL backed by DynamoDB).
-//! The mailbox only ever sees nameplates and candidate IP:port addresses — never the code
-//! words and never file data.
+//! The mailbox only ever sees nameplates, candidate IP:port addresses and WebRTC SDP — never the
+//! code words and never file data.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,10 +14,21 @@ pub const DEFAULT_URL: &str = match option_env!("WORMHOLE_MAILBOX_URL") {
     None => "https://n7pfkdycg2ts6xcat7ltivpvva0zhndg.lambda-url.eu-west-2.on.aws/",
 };
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+/// The web sender. The receiver prints `<WEB_URL>#<code>`; the fragment never leaves the browser.
+pub const WEB_URL: &str = match option_env!("WORMHOLE_WEB_URL") {
+    Some(u) => u,
+    None => "https://andykcheng.github.io/wormhole/",
+};
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct PeerInfo {
     pub v: u32,
+    /// Candidate IP:port addresses for the native QUIC transport.
+    #[serde(default)]
     pub addrs: Vec<String>,
+    /// WebRTC SDP: the receiver's offer, or a browser sender's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webrtc: Option<String>,
 }
 
 #[derive(Clone)]

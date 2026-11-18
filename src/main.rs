@@ -8,6 +8,7 @@ mod session;
 mod stun;
 mod transfer;
 mod tui;
+mod webrtc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -42,6 +43,9 @@ enum Cmd {
         /// Directory to save into.
         #[arg(short, long, default_value = ".")]
         out: PathBuf,
+        /// Don't accept browser (WebRTC) senders.
+        #[arg(long)]
+        no_webrtc: bool,
     },
     /// Send files and folders to a waiting receiver.
     #[command(visible_alias = "s")]
@@ -60,7 +64,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let opts = Options { mailbox: cli.mailbox };
+    let mut opts = Options { mailbox: cli.mailbox, no_webrtc: false };
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd {
         None | Some(Cmd::Tui) => tui::run(rt.handle().clone(), opts, None),
@@ -75,7 +79,8 @@ fn main() -> Result<()> {
             ));
             exit_on_err(res)
         }
-        Some(Cmd::Receive { out }) => {
+        Some(Cmd::Receive { out, no_webrtc }) => {
+            opts.no_webrtc = no_webrtc;
             let res = rt.block_on(cli::run(move |tx| Box::pin(session::receive(opts, out, tx)), true));
             exit_on_err(res)
         }

@@ -89,6 +89,45 @@ echo "== 3. same LAN, behind the same NAT"
 routers cone cone; transfer a a2 pass
 echo "== 4. same LAN, no mailbox (LAN discovery only)"
 SAVE=$ENVS; ENVS="WORMHOLE_MAILBOX=off"; transfer a a2 pass; ENVS=$SAVE
+browser_transfer() { # expect(pass|fail)
+  rm -rf /work/a/dst/* /work/a/recv.log
+  (cd /work/a/dst && NS a env WORMHOLE_MAILBOX=http://10.99.0.5:18383/ WORMHOLE_STUN=10.99.0.5:3478 \
+     wormhole receive > /work/a/recv.log 2>&1) &
+  local rpid=$! code=""
+  for _ in $(seq 1 50); do
+    code=$(grep -oE '[0-9]+-[a-z]+-[a-z]+' /work/a/recv.log 2>/dev/null | head -1)
+    [ -n "$code" ] && break; sleep 0.2
+  done
+  local out
+  out=$(NS b timeout 90 node /t/browser_send.mjs "https://10.99.0.5:18384/" "$code" 10.99.0.5:3478 9333 2>&1 | tail -1)
+  sleep 1
+  kill $rpid 2>/dev/null; wait $rpid 2>/dev/null
+  echo "    browser: $out" | cut -c1-200
+  local result=fail
+  if echo "$out" | grep -q '"ok":true'; then
+    result=pass
+    for f in a.txt dir/sub/rand.bin dir/nums.txt; do
+      want=$(echo "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['hashes']['$f'])")
+      got=$(sha256sum "/work/a/dst/$f" 2>/dev/null | cut -d' ' -f1)
+      [ "$want" = "$got" ] || { result=fail; echo "    mismatch: $f"; }
+    done
+  fi
+  if [ $result = $1 ]; then echo "  OK   (expected $1)"; else echo "  FAIL (expected $1, got $result)"; sed 's/^/    recv: /' /work/a/recv.log | tail -5; FAILED=1; fi
+}
+
+if [ -f /tb/node_modules/puppeteer-core/package.json ] && [ -f /web/spake2.wasm ] && command -v chromium >/dev/null; then
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=10.99.0.5 -keyout /tmp/k.pem -out /tmp/c.pem 2>/dev/null
+  NS wan python3 /tb/serve.py 18384 18383 /web /tmp/c.pem /tmp/k.pem &
+  NS b chromium --headless --no-sandbox --disable-gpu --disable-dev-shm-usage --user-data-dir=/tmp/chrome \
+     --ignore-certificate-errors --disable-features=WebRtcHideLocalIpsWithMdns \
+     --remote-debugging-address=127.0.0.1 --remote-debugging-port=9333 about:blank >/dev/null 2>&1 &
+  sleep 1
+  echo "== 7. browser behind NAT B → CLI behind NAT A (WebRTC hole punching)"
+  routers cone cone; browser_transfer pass
+else
+  echo "== 7. browser scenario SKIPPED (run: cd tests/browser && npm install; web/build.sh)"
+fi
+
 echo "== 5. one side symmetric NAT, other cone (hard case: expected to fail cleanly without a relay)"
 routers symmetric cone; transfer a b fail
 echo "== 6. both symmetric NATs (expected to fail cleanly without a relay)"
