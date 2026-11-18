@@ -107,7 +107,8 @@ $("send").onclick = async () => {
       }
     }, { mailboxUrl, ...(iceServers && { iceServers }) });
     $("fill").style.width = "100%";
-    const ratio = summary.bytes ? Math.round((100 * summary.wire) / summary.bytes) : 100;
+    const pct = summary.bytes ? (100 * summary.wire) / summary.bytes : 100;
+    const ratio = pct > 0 && pct < 1 ? "<1" : Math.round(pct);
     setStatus(`✔ Sent ${summary.files} file${summary.files === 1 ? "" : "s"} (${human(summary.bytes)}) in ${summary.secs.toFixed(1)}s — ` +
       `${human(summary.wire)} on the wire (compressed to ${ratio}%). Saved as: ${summary.saved.join(", ")}`, "ok");
     items = [];

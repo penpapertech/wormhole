@@ -24,14 +24,14 @@ pub fn describe(s: &Summary, verb: &str) -> String {
     let rate = if s.secs > 0.0 { s.bytes as f64 / s.secs } else { 0.0 };
     let ratio = if s.bytes > 0 { 100.0 * s.wire_bytes as f64 / s.bytes as f64 } else { 100.0 };
     format!(
-        "{verb} {} file{} ({}) in {:.1}s — {}/s, {} on the wire (compressed to {:.0}%)",
+        "{verb} {} file{} ({}) in {:.1}s — {}/s, {} on the wire (compressed to {})",
         s.files,
         if s.files == 1 { "" } else { "s" },
         HumanBytes(s.bytes),
         s.secs,
         HumanBytes(rate as u64),
         HumanBytes(s.wire_bytes),
-        ratio
+        if ratio > 0.0 && ratio < 1.0 { "<1%".to_string() } else { format!("{ratio:.0}%") }
     )
 }
 
