@@ -1,0 +1,41 @@
+[package]
+name = "wormhole"
+version = "0.1.0"
+edition = "2021"
+description = "Peer-to-peer file transfer across NATs with a short code"
+license = "MIT"
+repository = "https://github.com/andykcheng/wormhole"
+readme = "README.md"
+
+[[bin]]
+name = "wormhole"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hmac = "0.12"
+if-addrs = "0.13"
+indicatif = "0.17"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rand = "0.8"
+ratatui = "0.29"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shell-words = "1"
+socket2 = { version = "0.5", features = ["all"] }
+spake2 = "0.4"
+tar = "0.4"
+tokio = { version = "1", features = ["full"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
