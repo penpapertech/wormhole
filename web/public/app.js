@@ -1,16 +1,19 @@
-import { send, buildEntries, summarize, itemsFromDrop, parseCode, DEFAULT_MAILBOX } from "./wormhole.js";
+import { send, receive, buildEntries, summarize, itemsFromDrop, parseCode, DEFAULT_MAILBOX } from "./wormhole.js";
+import { folderSink, downloadSink, buildZip } from "./save.js";
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const mailboxUrl = params.get("mailbox") || DEFAULT_MAILBOX;
 // ?stun=host:port[,host:port] overrides the STUN servers (self-hosting / tests).
 const iceServers = params.get("stun") ? [{ urls: params.get("stun").split(",").map((h) => "stun:" + h) }] : undefined;
-// The receiver prints <page>#<code>; the fragment is never sent to the server.
+// The receiver prints <page>#<code>; the fragment is never sent to the server. #receive opens the
+// Receive tab.
 const fromHash = decodeURIComponent(location.hash.slice(1));
-if (fromHash) { $("code").value = fromHash; history.replaceState(null, "", location.pathname + location.search); }
+if (fromHash && fromHash !== "receive") { $("code").value = fromHash; history.replaceState(null, "", location.pathname + location.search); }
 
 let items = []; // [{path, file|null}]
 let busy = false;
+let receiving = null; // AbortController while a receive is running
 
 const human = (n) => {
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -121,6 +124,115 @@ $("send").onclick = async () => {
   }
 };
 
+// --- tabs
+function showTab(recv) {
+  $("tabSend").setAttribute("aria-selected", String(!recv));
+  $("tabRecv").setAttribute("aria-selected", String(recv));
+  $("sendPanel").hidden = recv;
+  $("recvPanel").hidden = !recv;
+  history.replaceState(null, "", location.pathname + location.search + (recv ? "#receive" : ""));
+}
+$("tabSend").onclick = () => showTab(false);
+$("tabRecv").onclick = () => showTab(true);
+if (fromHash === "receive") showTab(true);
+window.addEventListener("hashchange", () => {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h === "receive") { if (!receiving && !busy) showTab(true); }
+  else if (h && !busy) { $("code").value = h; showTab(false); render(); }
+});
+
+// --- receive
+const canPickFolder = typeof window.showDirectoryPicker === "function";
+if (!canPickFolder) {
+  const o = $("optFolder");
+  o.classList.add("disabled");
+  o.querySelector("input").disabled = true;
+  o.querySelector("small").textContent = "Not available in this browser (needs Chrome, Edge or another Chromium browser).";
+  document.querySelector('input[value="download"]').checked = true;
+}
+
+function recvStatus(text, cls = "muted") {
+  $("recvStatus").className = cls;
+  $("recvStatus").textContent = text;
+}
+
+const senderLink = (code) => location.origin + location.pathname + location.search + "#" + code;
+
+for (const b of document.querySelectorAll("[data-copy]")) {
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText($(b.dataset.copy).textContent); b.textContent = "Copied"; }
+    catch { b.textContent = "Copy failed"; }
+    setTimeout(() => (b.textContent = "Copy"), 1500);
+  };
+}
+
+function resetReceive() {
+  $("recvSetup").hidden = false;
+  $("recvCodeCard").hidden = true;
+  $("recvProgressCard").hidden = true;
+  $("tabSend").disabled = false;
+}
+
+$("recvStart").onclick = async () => {
+  const mode = document.querySelector('input[name="dest"]:checked').value;
+  let sink;
+  if (mode === "folder") {
+    try {
+      sink = folderSink(await window.showDirectoryPicker({ id: "wormhole-receive", mode: "readwrite" }));
+    } catch (e) {
+      if (e.name !== "AbortError") recvStatus("Could not open that folder: " + e.message, "err");
+      return;
+    }
+  } else {
+    sink = downloadSink();
+  }
+  receiving = new AbortController();
+  $("recvSetup").hidden = true;
+  $("recvProgressCard").hidden = false;
+  $("recvProgress").hidden = true;
+  $("recvCancel").hidden = false;
+  $("recvAgain").hidden = true;
+  $("tabSend").disabled = true;
+  recvStatus("Starting…");
+  try {
+    const s = await receive(sink, (ev, d) => {
+      if (ev === "status") recvStatus(d);
+      if (ev === "code") {
+        $("codeOut").textContent = d;
+        $("cmdOut").textContent = `wormhole send ${d} <files…>`;
+        $("linkOut").textContent = $("linkOut").href = senderLink(d);
+        $("recvCodeCard").hidden = false;
+      }
+      if (ev === "connected") { $("recvCodeCard").hidden = true; recvStatus(`Connected (${d.type})`); }
+      if (ev === "offer") {
+        $("recvCancel").hidden = true; // can't cancel mid-stream cleanly yet; closing the tab works
+        $("recvProgress").hidden = false;
+        $("recvFill").style.width = "0";
+        recvStatus(`Receiving ${d.files} file${d.files === 1 ? "" : "s"} (${human(d.bytes)})…`);
+      }
+      if (ev === "progress") {
+        $("recvFill").style.width = Math.min(100, (100 * d.done) / Math.max(1, d.total)).toFixed(1) + "%";
+        const rate = d.secs > 0.2 ? ` · ${human(d.done / d.secs)}/s` : "";
+        $("recvMeta").textContent = `${human(Math.min(d.done, d.total))} / ${human(d.total)}${rate}`;
+      }
+    }, { mailboxUrl, ...(iceServers && { iceServers }), signal: receiving.signal });
+    $("recvFill").style.width = "100%";
+    const where = s.sink === "folder" ? ` into “${sink.name}”` : s.download ? ` — downloaded as ${s.download.name}` : "";
+    recvStatus(`✔ Received ${s.files} file${s.files === 1 ? "" : "s"} (${human(s.bytes)}) in ${s.secs.toFixed(1)}s${where}. Saved as: ${s.saved.join(", ")}`, "ok");
+  } catch (err) {
+    $("recvCodeCard").hidden = true;
+    recvStatus(err.message === "Cancelled" ? "Cancelled." : "✘ " + err.message, err.message === "Cancelled" ? "muted" : "err");
+  } finally {
+    receiving = null;
+    $("recvCancel").hidden = true;
+    $("recvAgain").hidden = false;
+    $("tabSend").disabled = false;
+  }
+};
+$("recvCancel").onclick = () => receiving?.abort();
+$("recvAgain").onclick = resetReceive;
+window.addEventListener("beforeunload", (e) => { if (receiving || busy) e.preventDefault(); });
+
 render();
 // Hook for automated tests.
-window.wormhole = { send, buildEntries, iceServers };
+window.wormhole = { send, receive, buildEntries, folderSink, downloadSink, buildZip, iceServers };

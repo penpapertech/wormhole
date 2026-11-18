@@ -1,8 +1,13 @@
-// wormhole web sender: sends files/folders from the browser to `wormhole receive`.
+// wormhole in the browser: send files/folders to, and receive them from, `wormhole` (CLI) or
+// another browser.
 //
-// Flow: look up the receiver's WebRTC offer in the mailbox → post our answer → ICE/DTLS data
-// channel (peer to peer) → SPAKE2 with the code, bound to both DTLS fingerprints → stream
-// tar | gzip → receiver extracts on the fly.
+// The receiving side posts a WebRTC offer in the mailbox under a nameplate and shows the code; the
+// sender looks it up and posts its answer → ICE/DTLS data channel (peer to peer) → SPAKE2 with
+// the code, bound to both DTLS fingerprints → tar | gzip stream → the receiver extracts it on the
+// fly.
+
+import { WORDS } from "./words.js";
+import { extractTar } from "./save.js";
 
 export const DEFAULT_MAILBOX = "https://n7pfkdycg2ts6xcat7ltivpvva0zhndg.lambda-url.eu-west-2.on.aws/";
 const ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"] }];
@@ -21,6 +26,12 @@ export function parseCode(input) {
   }
   const nameplate = Number(np);
   return { nameplate, canonical: [String(nameplate), ...words].join("-") };
+}
+
+/** A fresh code for `nameplate`: two random words, like the CLI. */
+export function generateCode(nameplate) {
+  const r = crypto.getRandomValues(new Uint32Array(2));
+  return `${nameplate}-${WORDS[r[0] % WORDS.length]}-${WORDS[r[1] % WORDS.length]}`;
 }
 
 // ---------------------------------------------------------------- small helpers
@@ -379,6 +390,176 @@ export async function send(codeText, entries, on = () => {}, { mailboxUrl = DEFA
     await ch.drain();
     return summary;
   } finally {
+    setTimeout(() => pc.close(), 500);
+  }
+}
+
+// ---------------------------------------------------------------- receive
+
+function abortable(signal, ms) {
+  return new Promise((res, rej) => {
+    if (signal?.aborted) return rej(new Error("Cancelled"));
+    const t = setTimeout(res, ms);
+    signal?.addEventListener("abort", () => { clearTimeout(t); rej(new Error("Cancelled")); }, { once: true });
+  });
+}
+
+function checkOffer(offer) {
+  const bad = (offer.names || []).find((n) => !n || n === "." || n === ".." || /[/\\\0]/.test(n));
+  if (bad !== undefined || !Array.isArray(offer.names) || !offer.names.length) throw new Error(`unsafe name in offer: ${JSON.stringify(bad)}`);
+  const encoding = offer.encoding || "zstd";
+  if (encoding !== "gzip" && encoding !== "none") {
+    throw new Error(`the sender uses '${encoding}' compression, which browsers can't decode (update wormhole on the sending side)`);
+  }
+  return encoding;
+}
+
+/**
+ * Receive files into `sink` (see save.js). `on(event, data)` gets: status(text), code(code),
+ * connected({type}), offer(offer), progress({done,total,wire,secs}), done(summary).
+ * Resolves with {files, bytes, wire, secs, saved, download}. `signal` cancels while waiting.
+ */
+export async function receive(sink, on = () => {}, { mailboxUrl = DEFAULT_MAILBOX, iceServers = ICE_SERVERS, signal } = {}) {
+  const pc = new RTCPeerConnection({ iceServers });
+  let np = null;
+  const release = () => {
+    if (np === null) return;
+    mailbox(mailboxUrl, { op: "release", np: String(np) }).catch(() => {});
+    np = null;
+  };
+  try {
+    const dc = pc.createDataChannel("wormhole");
+    const opened = new Promise((res) => { dc.onopen = res; });
+    await pc.setLocalDescription(await pc.createOffer());
+    on("status", "Gathering network candidates…");
+    await withTimeout(new Promise((res) => {
+      if (pc.iceGatheringState === "complete") return res();
+      pc.addEventListener("icegatheringstatechange", () => pc.iceGatheringState === "complete" && res());
+    }), 4000, "gather").catch(() => {});
+    const offer = pc.localDescription.sdp;
+
+    // --- claim a nameplate (like the CLI: small numbers first)
+    on("status", "Registering with the rendezvous mailbox…");
+    const data = JSON.stringify({ v: 1, addrs: [], webrtc: offer });
+    for (let attempt = 0; attempt < 12 && np === null; attempt++) {
+      const cand = 1 + (crypto.getRandomValues(new Uint32Array(1))[0] % (attempt < 6 ? 999 : 9999));
+      const r = await mailbox(mailboxUrl, { op: "claim", np: String(cand), data });
+      if (r.status === 200) np = cand;
+      else if (r.status !== 409) throw new Error(`Mailbox error ${r.status}`);
+    }
+    if (np === null) throw new Error("Could not get a code from the mailbox; try again");
+    const codeText = generateCode(np);
+    on("code", codeText);
+
+    // --- wait for a sender's answer
+    on("status", "Waiting for the sender…");
+    const t0 = Date.now();
+    let answer = null;
+    let warnedOld = false;
+    while (!answer) {
+      await abortable(signal, Date.now() - t0 < 120000 ? 1000 : 3000);
+      let g;
+      try { g = await mailbox(mailboxUrl, { op: "get", np: String(np) }); } catch { continue; }
+      if (g.status === 404) { np = null; throw new Error("The code expired; get a new one"); }
+      if (g.status !== 200 || !g.body.s) continue;
+      const sinfo = JSON.parse(g.body.s);
+      if (sinfo.webrtc) answer = sinfo.webrtc;
+      else if (!warnedOld) {
+        warnedOld = true;
+        on("status", "A sender tried to connect with an older wormhole that can't send to browsers — it needs updating.");
+      }
+    }
+    on("status", "Sender found, connecting peer-to-peer…");
+    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    await withTimeout(opened, 30000, "Could not connect to the sender (strict NAT or UDP blocked on one side)");
+    release();
+    const ch = new Channel(dc);
+    pc.addEventListener("connectionstatechange", () => {
+      if (pc.connectionState === "failed") ch.fail(new Error("Connection to the sender was lost"));
+    });
+    on("connected", { type: await selectedPairType(pc) });
+
+    // --- authenticate (receiver role: answer the sender's messages)
+    on("status", "Authenticating…");
+    const binding = await sha256(concat(enc.encode("wormhole-webrtc-v1"), sdpFingerprint(offer), sdpFingerprint(answer)));
+    const parsed = parseCode(codeText);
+    const theirs = await ch.recvBin(30000);
+    const mine = await spakeStart(parsed.canonical);
+    await ch.send(mine);
+    const key = await spakeFinish(theirs);
+    const tag = await ch.recvBin(30000);
+    if (!key || !equalCT(tag, await hmac(key, enc.encode("sender"), binding))) {
+      await ch.send(JSON.stringify({ ok: false, error: "wrong code" })).catch(() => {});
+      await ch.drain();
+      throw new Error("Authentication failed: wrong code (or someone tried to guess it)");
+    }
+    await ch.send(await hmac(key, enc.encode("receiver"), binding));
+
+    // --- offer
+    const fileOffer = await ch.recvJson(60000);
+    let encoding, renames;
+    try {
+      encoding = checkOffer(fileOffer);
+      renames = await sink.begin(fileOffer);
+    } catch (e) {
+      await ch.send(JSON.stringify({ ok: false, error: e.message })).catch(() => {});
+      await ch.drain();
+      throw e;
+    }
+    on("offer", fileOffer);
+    await ch.send(JSON.stringify({ ok: true, error: null, saved: [] }));
+
+    // --- data: binary chunks until {"done":true}, extracted as they arrive
+    on("status", "Receiving…");
+    const start = performance.now();
+    let wire = 0, done = 0, lastTick = 0;
+    const total = fileOffer.tar_bytes || 0;
+    const tick = (force) => {
+      const now = performance.now();
+      if (force || now - lastTick > 100) { lastTick = now; on("progress", { done, total, wire, secs: (now - start) / 1000 }); }
+    };
+    let ctl;
+    const input = new ReadableStream({ start(c) { ctl = c; } }, { highWaterMark: Infinity });
+    const plain = encoding === "gzip" ? input.pipeThrough(new DecompressionStream("gzip")) : input;
+    let failed = null;
+    const extracting = extractTar(plain.getReader(), renames, sink, (n) => { done += n; tick(false); })
+      .catch((e) => { failed = e; throw e; });
+    extracting.catch(() => {});
+    try {
+      for (;;) {
+        const m = await Promise.race([ch.recv(120000), extracting.then(() => new Promise(() => {}))]);
+        if (m.bin) {
+          wire += m.bin.length;
+          if (!failed) ctl.enqueue(m.bin);
+          continue;
+        }
+        let v = {};
+        try { v = JSON.parse(m.text); } catch {}
+        if (v.done) break;
+        throw new Error("The sender stopped: " + (v.error || "unknown error"));
+      }
+      ctl.close();
+      const r = await extracting;
+      const download = await sink.finish();
+      tick(true);
+      const saved = fileOffer.names.map((n) => renames[n]);
+      await ch.send(JSON.stringify({ ok: true, error: null, saved }));
+      await ch.drain();
+      const summary = { files: r.files, bytes: r.bytes, wire, secs: (performance.now() - start) / 1000, saved, download, sink: sink.kind };
+      on("done", summary);
+      await sleep(300);
+      return summary;
+    } catch (e) {
+      const err = failed || e;
+      try { ctl.error(err); } catch {}
+      if (!ch.error) {
+        await ch.send(JSON.stringify({ ok: false, error: err.message })).catch(() => {});
+        await ch.drain();
+      }
+      throw err;
+    }
+  } finally {
+    release();
     setTimeout(() => pc.close(), 500);
   }
 }

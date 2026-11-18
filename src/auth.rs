@@ -84,26 +84,41 @@ pub async fn authenticate(
     Ok(())
 }
 
-/// Receiver side of the same handshake over a WebRTC data channel (browser senders). The binding
-/// value is a hash of both DTLS fingerprints instead of the TLS exporter.
-pub async fn authenticate_dc(conn: &mut crate::webrtc::DcConn, code: &Code) -> Result<()> {
-    let expect_binary = |m: crate::webrtc::Msg| -> Result<Vec<u8>> {
+/// The same handshake over a WebRTC data channel (browser peers). The binding value is a hash of
+/// both DTLS fingerprints instead of the TLS exporter. Messages are binary; a text message from
+/// the peer during the handshake is an error report (e.g. wrong code).
+pub async fn authenticate_dc(conn: &mut crate::webrtc::DcConn, code: &Code, is_sender: bool) -> Result<()> {
+    async fn recv_bin(conn: &mut crate::webrtc::DcConn) -> Result<Vec<u8>> {
+        let m = conn.recv().await.map_err(|_| anyhow!(WRONG_CODE))?;
         if !m.binary {
-            bail!("protocol error: expected a binary message");
+            let v: serde_json::Value = serde_json::from_slice(&m.data).unwrap_or_default();
+            match v.get("error").and_then(|e| e.as_str()) {
+                Some(e) if e.contains("wrong code") => bail!(WRONG_CODE),
+                Some(e) => bail!("peer error: {e}"),
+                None => bail!("protocol error: expected a binary message"),
+            }
         }
         Ok(m.data)
-    };
+    }
     let (state, msg) = Spake2::<Ed25519Group>::start_symmetric(
         &Password::new(code.password()),
         &Identity::new(b"wormhole-v1"),
     );
-    let peer_msg = expect_binary(conn.recv().await?)?;
-    conn.send(true, msg).await?;
-    let key = state.finish(&peer_msg).map_err(|_| anyhow!(WRONG_CODE))?;
     let binding = conn.binding;
-    let t = expect_binary(conn.recv().await?)?;
-    mac(&key, b"sender", &binding).verify_slice(&t).map_err(|_| anyhow!(WRONG_CODE))?;
-    let tag = mac(&key, b"receiver", &binding).finalize().into_bytes().to_vec();
-    conn.send(true, tag).await?;
+    if is_sender {
+        conn.send(true, msg).await?;
+        let peer_msg = recv_bin(conn).await?;
+        let key = state.finish(&peer_msg).map_err(|_| anyhow!(WRONG_CODE))?;
+        conn.send(true, mac(&key, b"sender", &binding).finalize().into_bytes().to_vec()).await?;
+        let t = recv_bin(conn).await?;
+        mac(&key, b"receiver", &binding).verify_slice(&t).map_err(|_| anyhow!(WRONG_CODE))?;
+    } else {
+        let peer_msg = recv_bin(conn).await?;
+        conn.send(true, msg).await?;
+        let key = state.finish(&peer_msg).map_err(|_| anyhow!(WRONG_CODE))?;
+        let t = recv_bin(conn).await?;
+        mac(&key, b"sender", &binding).verify_slice(&t).map_err(|_| anyhow!(WRONG_CODE))?;
+        conn.send(true, mac(&key, b"receiver", &binding).finalize().into_bytes().to_vec()).await?;
+    }
     Ok(())
 }

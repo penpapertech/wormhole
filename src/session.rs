@@ -127,7 +127,7 @@ async fn race(
         };
         let mut dc = crate::webrtc::accept(w, info, tx).await?;
         emit(tx, Event::Connected { peer: dc.peer, lan: connect::is_lan_addr(&dc.peer) });
-        if let Err(e) = auth::authenticate_dc(&mut dc, code).await {
+        if let Err(e) = auth::authenticate_dc(&mut dc, code, false).await {
             // Tell the browser explicitly, then close the channel cleanly.
             let _ = dc.send_text(r#"{"ok":false,"error":"wrong code"}"#).await;
             dc.close().await;
@@ -163,6 +163,17 @@ pub async fn send(opts: Options, code: String, paths: Vec<PathBuf>, recursive: b
         crate::events::warn(&tx, format!("skipping {s}"));
     }
     let mailbox = opts.mailbox();
+    // A browser receiver posts only a WebRTC offer (no QUIC addresses): answer it instead.
+    if let Some(mb) = &mailbox {
+        status(&tx, "Looking up the receiver…");
+        if let Ok(Some((Some(r), _))) = mb.get(code.nameplate).await {
+            if r.addrs.is_empty() {
+                if let Some(offer) = r.webrtc {
+                    return send_webrtc(mb, &code, &offer, plan, &tx).await;
+                }
+            }
+        }
+    }
     let prep = connect::prepare(&tx, mailbox.is_some()).await?;
     let (endpoint, conn) = connect::sender_connect(prep, &code, mailbox, &tx).await?;
     let (mut s, mut r) = conn.open_bi().await?;
@@ -174,4 +185,21 @@ pub async fn send(opts: Options, code: String, paths: Vec<PathBuf>, recursive: b
     conn.close(0u32.into(), b"done");
     let _ = tokio::time::timeout(Duration::from_secs(2), endpoint.wait_idle()).await;
     Ok(summary)
+}
+
+/// Send to a receiver running in a browser (WebRTC; we are the answerer).
+async fn send_webrtc(mb: &Mailbox, code: &Code, offer: &str, plan: transfer::Plan, tx: &Tx) -> Result<Summary> {
+    status(tx, "The receiver is a web browser; connecting over WebRTC…");
+    let a = crate::webrtc::answer(offer, true).await?;
+    let info = crate::mailbox::PeerInfo { v: 1, addrs: vec![], webrtc: Some(a.answer_sdp.clone()) };
+    if !mb.put_sender(code.nameplate, &info).await? {
+        anyhow::bail!("no receiver is waiting for code {code} (it may have expired)");
+    }
+    let mut dc = crate::webrtc::connect(a).await?;
+    emit(tx, Event::Connected { peer: dc.peer, lan: connect::is_lan_addr(&dc.peer) });
+    auth::authenticate_dc(&mut dc, code, true).await?;
+    status(tx, "Authenticated.");
+    let summary = transfer::send_dc(&mut dc, plan, tx).await;
+    dc.close().await;
+    summary
 }

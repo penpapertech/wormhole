@@ -207,6 +207,71 @@ impl Read for ChanReader {
     }
 }
 
+type Archiver = tokio::task::JoinHandle<Result<()>>;
+
+enum Enc {
+    Gzip(flate2::write::GzEncoder<ChanWriter>),
+    Zstd(zstd::Encoder<'static, ChanWriter>),
+}
+
+impl Enc {
+    fn finish(self) -> io::Result<ChanWriter> {
+        match self {
+            Enc::Gzip(g) => g.finish(),
+            Enc::Zstd(z) => z.finish(),
+        }
+    }
+}
+
+impl Write for Enc {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Enc::Gzip(g) => g.write(data),
+            Enc::Zstd(z) => z.write(data),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Enc::Gzip(g) => g.flush(),
+            Enc::Zstd(z) => z.flush(),
+        }
+    }
+}
+
+/// Build `tar | <encoding>` in a blocking thread; compressed chunks come out of the receiver.
+/// `progress` counts uncompressed tar bytes.
+fn spawn_archiver(entries: Vec<Entry>, encoding: &'static str, progress: Arc<AtomicU64>) -> (mpsc::Receiver<Vec<u8>>, Archiver) {
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(16);
+    let handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let w = ChanWriter { tx: chunk_tx, buf: Vec::with_capacity(CHUNK) };
+        let enc = if encoding == "gzip" {
+            // Level 1: browsers decompress gzip natively but nothing better; speed matters more.
+            Enc::Gzip(flate2::write::GzEncoder::new(w, flate2::Compression::fast()))
+        } else {
+            let mut z = zstd::Encoder::new(w, level())?;
+            z.include_checksum(true)?;
+            let _ = z.multithread(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1).min(8));
+            Enc::Zstd(z)
+        };
+        let mut b = tar::Builder::new(Counting { inner: enc, n: progress });
+        for e in &entries {
+            match e.kind {
+                Kind::Dir => b.append_dir(&e.name, &e.src),
+                Kind::File(_) => {
+                    let mut f = fs::File::open(&e.src)
+                        .with_context(|| format!("opening {}", e.src.display()))?;
+                    b.append_file(&e.name, &mut f)
+                }
+            }
+            .with_context(|| format!("reading {}", e.src.display()))?;
+        }
+        let mut w = b.into_inner()?.inner.finish()?;
+        w.flush()?;
+        Ok(())
+    });
+    (chunk_rx, handle)
+}
+
 fn level() -> i32 {
     std::env::var("WORMHOLE_ZSTD_LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3)
 }
@@ -227,31 +292,7 @@ pub async fn send(
 
     let start = Instant::now();
     let progress = Arc::new(AtomicU64::new(0));
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Vec<u8>>(16);
-    let p2 = progress.clone();
-    let entries = plan.entries;
-    let builder = tokio::task::spawn_blocking(move || -> Result<()> {
-        let w = ChanWriter { tx: chunk_tx, buf: Vec::with_capacity(CHUNK) };
-        let mut enc = zstd::Encoder::new(w, level())?;
-        enc.include_checksum(true)?;
-        let _ = enc.multithread(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1).min(8));
-        let mut b = tar::Builder::new(Counting { inner: enc, n: p2 });
-        for e in &entries {
-            match e.kind {
-                Kind::Dir => b.append_dir(&e.name, &e.src),
-                Kind::File(_) => {
-                    let mut f = fs::File::open(&e.src)
-                        .with_context(|| format!("opening {}", e.src.display()))?;
-                    b.append_file(&e.name, &mut f)
-                }
-            }
-            .with_context(|| format!("reading {}", e.src.display()))?;
-        }
-        let counting = b.into_inner()?;
-        let mut w = counting.inner.finish()?;
-        w.flush()?;
-        Ok(())
-    });
+    let (mut chunk_rx, builder) = spawn_archiver(plan.entries, "zstd", progress.clone());
 
     let mut data = conn.open_uni().await?;
     let mut wire = 0u64;
@@ -479,6 +520,63 @@ pub async fn receive(
             Err(e)
         }
     }
+}
+
+/// Largest data-channel message we send (browsers accept 256 KiB; stay well below).
+const DC_CHUNK: usize = 64 * 1024;
+
+fn dc_error(m: &crate::webrtc::Msg) -> String {
+    let v: serde_json::Value = serde_json::from_slice(&m.data).unwrap_or_default();
+    v.get("error").and_then(|e| e.as_str()).unwrap_or("unexpected message").to_string()
+}
+
+/// Send to a browser receiver over a WebRTC data channel. Same message flow as `receive_dc`;
+/// the stream is gzip because that is what browsers can decompress natively.
+pub async fn send_dc(conn: &mut crate::webrtc::DcConn, plan: Plan, tx: &Tx) -> Result<Summary> {
+    let mut offer = plan.offer.clone();
+    offer.encoding = Some("gzip".into());
+    conn.send_text(&serde_json::to_string(&offer)?).await?;
+    let m = conn.recv().await.context("waiting for the receiver")?;
+    let answer: Answer = serde_json::from_slice(&m.data).context("protocol error: bad answer")?;
+    if !answer.ok {
+        bail!("receiver declined: {}", answer.error.unwrap_or_default());
+    }
+
+    let start = Instant::now();
+    let progress = Arc::new(AtomicU64::new(0));
+    let (mut chunk_rx, builder) = spawn_archiver(plan.entries, "gzip", progress.clone());
+    let mut wire = 0u64;
+    let mut last = Instant::now();
+    while let Some(chunk) = chunk_rx.recv().await {
+        // The receiver only talks during the stream if something went wrong.
+        if let Some(m) = conn.try_recv() {
+            bail!("receiver failed: {}", dc_error(&m));
+        }
+        for part in chunk.chunks(DC_CHUNK) {
+            wire += part.len() as u64;
+            conn.send(true, part.to_vec()).await.context("sending data")?;
+        }
+        if last.elapsed() > Duration::from_millis(100) {
+            last = Instant::now();
+            emit(tx, Event::Progress { done: progress.load(Ordering::Relaxed), total: offer.tar_bytes });
+        }
+    }
+    builder.await.context("archiver task")??;
+    conn.send_text(r#"{"done":true}"#).await?;
+    emit(tx, Event::Progress { done: offer.tar_bytes, total: offer.tar_bytes });
+
+    let m = conn.recv().await.context("waiting for the receiver to confirm")?;
+    let answer: Answer = serde_json::from_slice(&m.data).context("protocol error: bad answer")?;
+    if !answer.ok {
+        bail!("receiver failed: {}", answer.error.unwrap_or_default());
+    }
+    Ok(Summary {
+        files: offer.files,
+        bytes: offer.bytes,
+        wire_bytes: wire,
+        secs: start.elapsed().as_secs_f64(),
+        names: if answer.saved.is_empty() { offer.names } else { answer.saved },
+    })
 }
 
 /// Receive over a WebRTC data channel from a browser. Messages: text JSON offer → text JSON

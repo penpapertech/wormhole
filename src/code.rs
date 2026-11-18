@@ -127,6 +127,13 @@ mod tests {
     }
 
     #[test]
+    fn web_wordlist_matches() {
+        let js = include_str!("../web/public/words.js");
+        let web: Vec<&str> = js.split('"').skip(1).step_by(2).collect();
+        assert_eq!(web, WORDS, "web/public/words.js is out of sync with WORDS");
+    }
+
+    #[test]
     fn tags_depend_only_on_nameplate() {
         let a = Code::parse("5-apple-pie").unwrap();
         let b = Code::parse("5-other-words").unwrap();

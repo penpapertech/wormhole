@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>wormhole — send files</title>
-<meta name="description" content="Send files and folders peer-to-peer to a computer running `wormhole receive`.">
+<title>wormhole</title>
+<meta name="description" content="Send and receive files and folders peer-to-peer, between browsers and the wormhole command-line tool.">
 <style>
   :root {
     --bg: #f6f7f9; --card: #ffffff; --text: #1b1f24; --muted: #667085; --line: #e4e7ec;
@@ -53,17 +53,41 @@
   .ok { color: var(--ok); } .err { color: var(--err); } .muted { color: var(--muted); }
   footer { color: var(--muted); font-size: 13px; margin-top: 22px; }
   footer a { color: var(--accent); }
-  @media (max-width: 480px) { main { padding-top: 20px; } input#code { font-size: 18px; } }
+  .tabs { display: flex; gap: 6px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 4px; margin-bottom: 14px; }
+  .tabs button { flex: 1; border: 0; background: transparent; font-weight: 600; color: var(--muted); }
+  .tabs button[aria-selected="true"] { background: var(--accent-soft); color: var(--text); }
+  .opt { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; cursor: pointer; }
+  .opt input { margin-top: 4px; }
+  .opt small { display: block; color: var(--muted); }
+  .opt.disabled { opacity: .55; cursor: not-allowed; }
+  .bigcode { font: 700 30px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .01em; margin: 6px 0 14px;
+             word-break: break-all; color: var(--accent); }
+  .how { display: grid; grid-template-columns: auto 1fr auto; gap: 8px 10px; align-items: center; font-size: 14px; }
+  .how .k { color: var(--muted); }
+  .how code, .how a { overflow-wrap: anywhere; }
+  .how a { color: var(--accent); }
+  .how button { padding: 3px 10px; font-size: 13px; }
+  #recvActions { display: flex; gap: 8px; margin-top: 12px; }
+  #recvActions button { flex: 1; }
+  @media (max-width: 480px) { main { padding-top: 20px; } input#code { font-size: 18px; } .bigcode { font-size: 24px; }
+                              .how { grid-template-columns: 1fr auto; } .how .k { grid-column: 1 / -1; margin-top: 4px; } }
 </style>
 </head>
 <body>
 <main>
-  <header><h1>wormhole</h1><span>send files peer-to-peer</span></header>
+  <header><h1>wormhole</h1><span>files peer-to-peer</span></header>
 
+  <nav class="tabs" role="tablist">
+    <button id="tabSend" role="tab" aria-selected="true">Send</button>
+    <button id="tabRecv" role="tab" aria-selected="false">Receive</button>
+  </nav>
+
+  <div id="sendPanel">
   <section class="card">
     <label class="field" for="code">Code from the receiver</label>
     <input id="code" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="7-purple-sausage">
-    <div class="hint">On the receiving computer run <code>wormhole receive</code> and type the code it shows.</div>
+    <div class="hint">On the receiving computer run <code>wormhole receive</code> (or open this page and choose
+      <em>Receive</em>) and type the code it shows.</div>
   </section>
 
   <section class="card">
@@ -86,10 +110,43 @@
     </div>
     <div id="status" class="muted"></div>
   </section>
+  </div>
+
+  <div id="recvPanel" hidden>
+  <section class="card" id="recvSetup">
+    <label class="field">Where should received files go?</label>
+    <label class="opt" id="optFolder"><input type="radio" name="dest" value="folder" checked>
+      <span>Into a folder I choose<small>Files are written as they arrive, any size. Chrome, Edge and other Chromium browsers.</small></span></label>
+    <label class="opt"><input type="radio" name="dest" value="download">
+      <span>As a download<small>One file as itself, several as a .zip. Every browser; kept in memory until done (up to ~4 GB).</small></span></label>
+    <button class="primary" id="recvStart" style="margin-top:10px">Get a code</button>
+  </section>
+
+  <section class="card" id="recvCodeCard" hidden>
+    <div class="hint" style="margin-top:0">Give this code to the sender</div>
+    <div class="bigcode" id="codeOut"></div>
+    <div class="how">
+      <span class="k">Terminal</span><code id="cmdOut"></code><button data-copy="cmdOut">Copy</button>
+      <span class="k">Browser</span><a id="linkOut" target="_blank" rel="noopener"></a><button data-copy="linkOut">Copy</button>
+    </div>
+  </section>
+
+  <section class="card" id="recvProgressCard" hidden>
+    <div id="recvProgress" hidden>
+      <div class="bar"><div id="recvFill"></div></div>
+      <div class="muted" id="recvMeta"></div>
+    </div>
+    <div id="recvStatus" class="muted"></div>
+    <div id="recvActions">
+      <button id="recvCancel">Cancel</button>
+      <button id="recvAgain" hidden>Receive more</button>
+    </div>
+  </section>
+  </div>
 
   <footer>
     Files travel directly between the two computers over an encrypted WebRTC connection; the
-    rendezvous server only helps them find each other. <a href="https://github.com/andykcheng/wormhole">Source &amp; CLI</a>
+    rendezvous server only helps them find each other and never sees the code or the files. <a href="https://github.com/andykcheng/wormhole">Source &amp; CLI</a>
   </footer>
 </main>
 <script type="module" src="app.js"></script>

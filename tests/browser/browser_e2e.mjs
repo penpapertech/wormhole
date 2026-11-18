@@ -1,4 +1,5 @@
-// Browser → CLI end-to-end tests: headless Chromium sends to `wormhole receive` over WebRTC.
+// Browser end-to-end tests over WebRTC: headless Chromium sends to `wormhole receive`, receives
+// from `wormhole send`, and talks to another browser page.
 // Usage: (cd tests/browser && npm install && node browser_e2e.mjs [path/to/wormhole])
 // Browser: CHROME=/path/to/chrome to launch a local one; otherwise Chromium runs in Docker
 // (tests/browser/Dockerfile, host network) — snap-packaged Chromium can't reach local servers.
@@ -188,6 +189,186 @@ async function main() {
     const good = r.ok && sha(readFileSync(join(dst, "big.bin"))) === sha(expected(spec[0]));
     good ? ok(`${(50 / r.summary.secs).toFixed(1)} MB/s browser → CLI (same machine)`) : fail(r.error || "content mismatch");
     rmSync(dst, { recursive: true, force: true });
+  }
+
+  // ---------------------------------------------------------------- browser receiving
+  const SRC_SPEC = SPEC; // same tree, now sent by the CLI
+  const makeSrc = () => {
+    const d = mkdtempSync(join(tmpdir(), "wh-src-"));
+    for (const s of SRC_SPEC) {
+      const p = join(d, s.path);
+      if (s.dir) { mkdirSync(p, { recursive: true }); continue; }
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, expected(s));
+    }
+    return d;
+  };
+  const tops = [...new Set(SRC_SPEC.map((s) => s.path.split("/")[0]))];
+
+  // Start receiving in `pg` (sink: "folder" = origin-private file system, or "download");
+  // resolves with the code once it is shown.
+  const pageReceive = (pg, mode, preexisting) =>
+    pg.evaluate(async (mode, mailboxUrl, preexisting) => {
+      const root = await navigator.storage.getDirectory();
+      for await (const [name] of root.entries()) await root.removeEntry(name, { recursive: true });
+      for (const [name, text] of Object.entries(preexisting || {})) {
+        const w = await (await root.getFileHandle(name, { create: true })).createWritable();
+        await w.write(text); await w.close();
+      }
+      let dl = null;
+      const nullSink = { kind: "null", begin: async (o) => Object.fromEntries(o.names.map((n) => [n, n])), dir: async () => {},
+        file: async (s, n, pieces) => { for await (const _ of pieces); }, finish: async () => null }; // eslint-disable-line no-unused-vars
+      const sink = mode === "folder" ? window.wormhole.folderSink(root) : mode === "null" ? nullSink
+        : window.wormhole.downloadSink((name, blob) => { dl = { name, blob }; });
+      let gotCode;
+      const codeP = new Promise((r) => (gotCode = r));
+      const b64 = async (blob) => { const u = new Uint8Array(await blob.arrayBuffer()); let s = ""; for (let i = 0; i < u.length; i += 32768) s += String.fromCharCode(...u.subarray(i, i + 32768)); return btoa(s); };
+      window.__rx = window.wormhole.receive(sink, (e, d) => { if (e === "code") gotCode(d); if (e !== "progress") console.log("rx", e, JSON.stringify(d)); }, { mailboxUrl })
+        .then(async (s) => ({ ok: true, s, dl: dl && { name: dl.name, b64: await b64(dl.blob) } }), (e) => ({ ok: false, error: e.message }));
+      return Promise.race([codeP, window.__rx.then((r) => { throw new Error("receive ended early: " + r.error); })]);
+    }, mode, PAGE_MAILBOX, preexisting);
+  const pageResult = (pg, ms = 60000) =>
+    Promise.race([pg.evaluate(() => window.__rx), sleep(ms).then(() => ({ ok: false, error: "browser receive timed out" }))]);
+  const opfsHashes = (pg) =>
+    pg.evaluate(async () => {
+      const out = {};
+      const walk = async (d, pre) => {
+        for await (const [n, h] of d.entries()) {
+          const p = pre ? pre + "/" + n : n;
+          if (h.kind === "directory") { out[p + "/"] = "dir"; await walk(h, p); continue; }
+          const dg = new Uint8Array(await crypto.subtle.digest("SHA-256", await (await h.getFile()).arrayBuffer()));
+          out[p] = [...dg].map((x) => x.toString(16).padStart(2, "0")).join("");
+        }
+      };
+      await walk(await navigator.storage.getDirectory(), "");
+      return out;
+    });
+  const cliSend = (code, args, cwd) => bg(BIN, ["send", code, ...args], { cwd, env: { ...process.env, WORMHOLE_MAILBOX: MAILBOX } });
+  const checkTree = (have, rename = {}) => {
+    let bad = 0;
+    for (const s of SRC_SPEC) {
+      const top = s.path.split("/")[0];
+      const p = (rename[top] ? s.path.replace(top, rename[top]) : s.path) + (s.dir ? "/" : "");
+      const want = s.dir ? "dir" : sha(expected(s));
+      if (have[p] !== want) { bad++; console.log("    mismatch", p); }
+    }
+    return bad;
+  };
+
+  if (only(5)) console.log("== 5. CLI → browser (save into a folder): nested folders, long path, unicode, empty file & dir, name collision");
+  if (only(5)) {
+    const src = makeSrc();
+    await page.reload();
+    const code = await pageReceive(page, "folder", { "hello.txt": "pre-existing\n" });
+    const p = cliSend(code, ["-R", ...tops], src);
+    const r = await pageResult(page);
+    const rc = await Promise.race([p.done, sleep(20000).then(() => "timeout")]);
+    if (!r.ok || rc !== 0) fail(`browser: ${r.error || "ok"}; sender rc=${rc}\n${strip(p.out)}`);
+    else {
+      const have = await opfsHashes(page);
+      let bad = checkTree(have, { "hello.txt": "hello (1).txt" });
+      if (have["hello.txt"] !== sha(Buffer.from("pre-existing\n"))) { bad++; console.log("    pre-existing file changed"); }
+      bad ? fail(`${bad} entries wrong`) : ok(`all files identical (${r.s.files} files, ${r.s.wire} bytes on the wire); saved as ${r.s.saved.join(", ")}`);
+      console.log("    sender: " + strip(p.out).split("\n").filter((l) => /Connected|Sent|receiver is/.test(l)).map((l) => l.trim()).join(" | "));
+    }
+    rmSync(src, { recursive: true, force: true });
+  }
+
+  if (only(6)) console.log("== 6. CLI → browser (download as .zip)");
+  if (only(6)) {
+    const src = makeSrc();
+    await page.reload();
+    const code = await pageReceive(page, "download");
+    const p = cliSend(code, ["-R", ...tops], src);
+    const r = await pageResult(page);
+    await Promise.race([p.done, sleep(20000)]);
+    if (!r.ok || !r.dl) fail(`browser: ${r.error || "no download"}\n${strip(p.out)}`);
+    else {
+      const zdir = mkdtempSync(join(tmpdir(), "wh-zip-"));
+      writeFileSync(join(zdir, "x.zip"), Buffer.from(r.dl.b64, "base64"));
+      // Python's zipfile checks every CRC, then we compare contents.
+      const listing = execSync(`python3 -I -c "import zipfile,sys,hashlib,json; z=zipfile.ZipFile(sys.argv[1]); assert z.testzip() is None; print(json.dumps({i.filename: ('dir' if i.is_dir() else hashlib.sha256(z.read(i)).hexdigest()) for i in z.infolist()}))" ${join(zdir, "x.zip")}`).toString();
+      const bad = checkTree(JSON.parse(listing));
+      bad ? fail(`${bad} entries wrong in ${r.dl.name}`) : ok(`${r.dl.name}: ${Buffer.from(r.dl.b64, "base64").length} bytes, all CRCs and contents correct`);
+      rmSync(zdir, { recursive: true, force: true });
+    }
+    rmSync(src, { recursive: true, force: true });
+  }
+
+  if (only(7)) console.log("== 7. browser → browser");
+  if (only(7)) {
+    const page2 = await browser.newPage();
+    page2.on("console", (m) => process.env.DEBUG && console.log("  [page2]", m.text()));
+    await page2.goto(`${PAGE_ORIGIN}/?mailbox=${encodeURIComponent(PAGE_MAILBOX)}`);
+    await page.reload();
+    const code = await pageReceive(page2, "folder");
+    const sent = await pageSend(code, SPEC);
+    const r = await pageResult(page2);
+    if (!sent.ok || !r.ok) fail(`sender: ${sent.error || "ok"}; receiver: ${r.error || "ok"}`);
+    else {
+      const bad = checkTree(await opfsHashes(page2));
+      const conn = sent.events.find((e) => e[0] === "connected");
+      bad ? fail(`${bad} entries wrong`) : ok(`all files identical (${r.s.files} files, ${conn?.[1]?.type})`);
+    }
+    await page2.close();
+  }
+
+  if (only(8)) console.log("== 8. CLI → browser with a wrong code is rejected on both sides");
+  if (only(8)) {
+    const src = makeSrc();
+    await page.reload();
+    const code = await pageReceive(page, "folder");
+    const p = cliSend(code.split("-")[0] + "-wrong-guess", ["hello.txt"], src);
+    const r = await pageResult(page, 30000);
+    const rc = await Promise.race([p.done, sleep(20000).then(() => "timeout")]);
+    const files = Object.keys(await opfsHashes(page));
+    !r.ok && /wrong code/i.test(r.error) && rc !== 0 && /wrong code/.test(strip(p.out)) && files.length === 0
+      ? ok(`browser: "${r.error}"; sender exited ${rc}`)
+      : fail(`browser: ${JSON.stringify(r)} sender rc=${rc} files=${files}\n${strip(p.out)}`);
+    rmSync(src, { recursive: true, force: true });
+  }
+
+  if (only(9)) console.log("== 9. throughput: CLI → browser, 50 MB incompressible");
+  if (only(9)) {
+    const src = mkdtempSync(join(tmpdir(), "wh-src-"));
+    const spec = { path: "big.bin", rand: 50_000_000, seed: 11 };
+    writeFileSync(join(src, "big.bin"), expected(spec));
+    await page.reload();
+    const sinkMode = process.env.THRU_SINK || "folder";
+    const code = await pageReceive(page, sinkMode);
+    const p = cliSend(code, ["big.bin"], src);
+    const r = await pageResult(page, 120000);
+    await Promise.race([p.done, sleep(20000)]);
+    const have = r.ok ? await opfsHashes(page) : {};
+    r.ok && (sinkMode === "null" || have["big.bin"] === sha(expected(spec)))
+      ? ok(`${(50 / r.s.secs).toFixed(1)} MB/s CLI → browser (same machine)`)
+      : fail((r.error || "content mismatch") + "\n" + strip(p.out));
+    rmSync(src, { recursive: true, force: true });
+  }
+
+  if (only(10)) console.log("== 10. browser UI: Receive tab → download");
+  if (only(10)) {
+    const src = makeSrc();
+    const cdp = await browser.target().createCDPSession();
+    const downloads = [];
+    cdp.on("Browser.downloadProgress", (e) => { if (e.state === "completed") downloads.push(e); });
+    await cdp.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: "/tmp/wh-downloads", eventsEnabled: true });
+    await page.goto(`${PAGE_ORIGIN}/?mailbox=${encodeURIComponent(PAGE_MAILBOX)}#receive`);
+    await page.click('input[value="download"]');
+    await page.click("#recvStart");
+    await page.waitForFunction(() => document.querySelector("#codeOut").textContent, { timeout: 20000 });
+    const code = await page.$eval("#codeOut", (e) => e.textContent);
+    const link = await page.$eval("#linkOut", (e) => e.href);
+    const p = cliSend(code, ["hello.txt", "ünïcødé ✓.txt"], src);
+    await page.waitForFunction(() => /✔|✘/.test(document.querySelector("#recvStatus").textContent), { timeout: 40000 });
+    const status = await page.$eval("#recvStatus", (e) => e.textContent);
+    for (let i = 0; i < 50 && !downloads.length; i++) await sleep(100);
+    await Promise.race([p.done, sleep(10000)]);
+    status.startsWith("✔") && downloads.length === 1 && downloads[0].totalBytes > 0 && link.endsWith("#" + code)
+      ? ok(`${status.slice(0, 120)} (download ${downloads[0].totalBytes} bytes)`)
+      : fail(`${status} downloads=${JSON.stringify(downloads)}\n${strip(p.out)}`);
+    await cdp.detach();
+    rmSync(src, { recursive: true, force: true });
   }
 
   if (process.env.CHROME) await browser.close(); else execSync("docker rm -f wh-chrome-test >/dev/null 2>&1 || true");

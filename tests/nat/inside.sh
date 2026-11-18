@@ -115,6 +115,32 @@ browser_transfer() { # expect(pass|fail)
   if [ $result = $1 ]; then echo "  OK   (expected $1)"; else echo "  FAIL (expected $1, got $result)"; sed 's/^/    recv: /' /work/a/recv.log | tail -5; FAILED=1; fi
 }
 
+browser_receive() { # expect(pass|fail): CLI on peer a sends to a browser on peer b
+  local out=/work/b/brecv.log
+  rm -f $out
+  NS b timeout 90 node /t/browser_recv.mjs "https://10.99.0.5:18384/" 10.99.0.5:3478 9333 > $out 2>&1 &
+  local bpid=$! code=""
+  for _ in $(seq 1 100); do
+    code=$(sed -n 's/^CODE //p' $out | head -1)
+    [ -n "$code" ] && break; sleep 0.2
+  done
+  (cd /work/a/src && NS a env WORMHOLE_MAILBOX=http://10.99.0.5:18383/ WORMHOLE_STUN=10.99.0.5:3478 \
+     timeout 60 wormhole send "$code" -R a.txt dir > /work/a/send.log 2>&1)
+  wait $bpid 2>/dev/null
+  local res; res=$(tail -1 $out)
+  echo "    browser: $res" | cut -c1-160
+  local result=fail
+  if echo "$res" | grep -q '"ok":true'; then
+    result=pass
+    for f in a.txt dir/sub/rand.bin dir/nums.txt; do
+      want=$(sha256sum "/work/a/src/$f" | cut -d' ' -f1)
+      got=$(echo "$res" | python3 -c "import json,sys; print(json.load(sys.stdin)['hashes'].get('$f',''))")
+      [ "$want" = "$got" ] || { result=fail; echo "    mismatch: $f"; }
+    done
+  fi
+  if [ $result = $1 ]; then echo "  OK   (expected $1)"; else echo "  FAIL (expected $1, got $result)"; sed 's/^/    send: /' /work/a/send.log | tail -5; FAILED=1; fi
+}
+
 if [ -f /tb/node_modules/puppeteer-core/package.json ] && [ -f /web/spake2.wasm ] && command -v chromium >/dev/null; then
   openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=10.99.0.5 -keyout /tmp/k.pem -out /tmp/c.pem 2>/dev/null
   NS wan python3 /tb/serve.py 18384 18383 /web /tmp/c.pem /tmp/k.pem &
@@ -124,6 +150,8 @@ if [ -f /tb/node_modules/puppeteer-core/package.json ] && [ -f /web/spake2.wasm 
   sleep 1
   echo "== 7. browser behind NAT B → CLI behind NAT A (WebRTC hole punching)"
   routers cone cone; browser_transfer pass
+  echo "== 8. CLI behind NAT A → browser behind NAT B (CLI answers the browser's offer)"
+  routers cone cone; browser_receive pass
 else
   echo "== 7. browser scenario SKIPPED (run: cd tests/browser && npm install; web/build.sh)"
 fi
