@@ -173,6 +173,7 @@ def handler(event, context):
 
 
 def serve(port):
+    import socketserver
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     store = MemoryStore()
@@ -208,7 +209,14 @@ def serve(port):
             if os.environ.get("MAILBOX_LOG"):
                 super().log_message(fmt, *args)
 
-    ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+    class Server(ThreadingHTTPServer):
+        # HTTPServer.server_bind() looks up the host's FQDN, which can hang for a long time on
+        # macOS (seen on GitHub's runners); the name is only used for logging.
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = "localhost", self.server_address[1]
+
+    Server(("0.0.0.0", port), H).serve_forever()
 
 
 if __name__ == "__main__":
