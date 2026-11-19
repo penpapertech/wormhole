@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Peer-to-peer file transfer across NATs with a short code"
 license = "MIT"
-repository = "https://github.com/andykcheng/wormhole"
+repository = "https://github.com/penpapertech/wormhole"
 readme = "README.md"
 
 [[bin]]

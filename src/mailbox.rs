@@ -17,7 +17,7 @@ pub const DEFAULT_URL: &str = match option_env!("WORMHOLE_MAILBOX_URL") {
 /// The web sender. The receiver prints `<WEB_URL>#<code>`; the fragment never leaves the browser.
 pub const WEB_URL: &str = match option_env!("WORMHOLE_WEB_URL") {
     Some(u) => u,
-    None => "https://andykcheng.github.io/wormhole/",
+    None => "https://penpapertech.github.io/wormhole/",
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

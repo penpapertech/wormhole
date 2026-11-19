@@ -9,7 +9,7 @@ computer A $ wormhole receive
   On the other computer run:
       wormhole send 42-maple-sunset <files…>
   or send from a browser:
-      https://andykcheng.github.io/wormhole/#42-maple-sunset
+      https://penpapertech.github.io/wormhole/#42-maple-sunset
 
 computer B $ wormhole send 42-maple-sunset -R *
   Connected to 81.2.69.160:52811 (direct over the internet)
@@ -31,7 +31,7 @@ computer B $ wormhole send 42-maple-sunset -R *
   and a failed guess aborts the transfer.
 - **TUI or CLI.** Run `wormhole` with no arguments for an interactive UI where you can drag and
   drop files onto the terminal window, or script it with `receive` and `send`.
-- **Works in a browser too.** The [web page](https://andykcheng.github.io/wormhole/) can send to
+- **Works in a browser too.** The [web page](https://penpapertech.github.io/wormhole/) can send to
   and receive from the CLI or another browser, with nothing to install. Drag files or folders in to
   send. To receive, the page shows a code and either writes straight into a folder you pick
   (Chrome, Edge) or offers a download (a single file, or a .zip). Data goes peer to peer over
@@ -39,16 +39,83 @@ computer B $ wormhole send 42-maple-sunset -R *
 
 ## Install
 
-Download a binary from [Releases](https://github.com/andykcheng/wormhole/releases) (Linux
-x86_64/aarch64 static musl builds, macOS arm64/x86_64), or build from source:
+Prebuilt binaries are on the [Releases](https://github.com/penpapertech/wormhole/releases) page.
+Each is a single file with no dependencies. Pick your platform:
+
+| Platform | Download |
+|---|---|
+| macOS, Apple Silicon (M1 and later) | `wormhole-macos-arm64.tar.gz` |
+| macOS, Intel | `wormhole-macos-x86_64.tar.gz` |
+| Linux, x86_64 (most PCs and servers) | `wormhole-linux-x86_64.tar.gz` |
+| Linux, ARM64 (Raspberry Pi 4/5 with a 64-bit OS, Graviton, Ampere) | `wormhole-linux-aarch64.tar.gz` |
+
+Not sure which one? Run `uname -sm`: `Darwin arm64` is Apple Silicon, `Darwin x86_64` is an
+Intel Mac, `Linux x86_64` is Linux x86_64, `Linux aarch64` is Linux ARM64.
+
+### macOS
 
 ```sh
-cargo install --git https://github.com/andykcheng/wormhole
+# Apple Silicon (use wormhole-macos-x86_64 on an Intel Mac)
+curl -fsSL https://github.com/penpapertech/wormhole/releases/latest/download/wormhole-macos-arm64.tar.gz | tar xz
+sudo mv wormhole /usr/local/bin/
+wormhole --help
 ```
 
-On macOS, a downloaded binary may be quarantined. Run `xattr -d com.apple.quarantine wormhole`.
-The first time it runs, macOS may also ask to allow your terminal to access the local network
-(needed for LAN discovery).
+The binary isn't signed by Apple. If you downloaded it with a browser instead of `curl`, macOS
+blocks it on first run ("cannot be opened because the developer cannot be verified"). Clear the
+quarantine flag once:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/wormhole
+```
+
+The first time it runs, macOS may ask to let your terminal access the local network. Allow it;
+it's needed to find the other computer when both are on the same Wi-Fi.
+
+### Linux
+
+```sh
+# x86_64 (use wormhole-linux-aarch64 on ARM64)
+curl -fsSL https://github.com/penpapertech/wormhole/releases/latest/download/wormhole-linux-x86_64.tar.gz | tar xz
+mkdir -p ~/.local/bin && mv wormhole ~/.local/bin/
+wormhole --help
+```
+
+The Linux builds are statically linked (musl), so they run on any distribution, including Alpine
+and old glibc systems. If `wormhole` isn't found, add `~/.local/bin` to your `PATH`, or move the
+binary to `/usr/local/bin` with `sudo` instead.
+
+### Verify the download (optional)
+
+Each archive has a `.sha256` file next to it:
+
+```sh
+curl -fsSLO https://github.com/penpapertech/wormhole/releases/latest/download/wormhole-linux-x86_64.tar.gz
+curl -fsSLO https://github.com/penpapertech/wormhole/releases/latest/download/wormhole-linux-x86_64.tar.gz.sha256
+shasum -a 256 -c wormhole-linux-x86_64.tar.gz.sha256    # or: sha256sum -c …
+```
+
+### Windows
+
+There's no native Windows build. Use the [web page](https://penpapertech.github.io/wormhole/) in
+Chrome or Edge, which can send to and receive from the CLI, or run the Linux x86_64 build under
+WSL.
+
+### From source
+
+With a [Rust toolchain](https://rustup.rs) (stable):
+
+```sh
+cargo install --git https://github.com/penpapertech/wormhole
+```
+
+This puts `wormhole` in `~/.cargo/bin`.
+
+### Updating and uninstalling
+
+To update, repeat the install commands; `latest` always points at the newest release. To
+uninstall, delete the binary (`/usr/local/bin/wormhole`, `~/.local/bin/wormhole` or
+`~/.cargo/bin/wormhole`). wormhole keeps no config files or caches.
 
 ## Usage
 
@@ -58,7 +125,7 @@ The first time it runs, macOS may also ask to allow your terminal to access the 
 | `wormhole receive` (`r`) | Print a code, wait, save into the current folder (`-o DIR` to choose) |
 | `wormhole send CODE FILE…` (`s`) | Send files; add `-R` for folders, e.g. `wormhole send CODE -R *` |
 | `wormhole send CODE` | Open the TUI send screen with the code filled in, then drop files |
-| [web page](https://andykcheng.github.io/wormhole/) | Send from a browser, or open *Receive* to get a code there (`wormhole send CODE …` works with it) |
+| [web page](https://penpapertech.github.io/wormhole/) | Send from a browser, or open *Receive* to get a code there (`wormhole send CODE …` works with it) |
 
 Options and environment variables:
 
