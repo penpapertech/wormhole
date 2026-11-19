@@ -35,15 +35,27 @@ pub fn describe(s: &Summary, verb: &str) -> String {
     )
 }
 
-pub async fn run<F>(fut: F, receiving: bool) -> Result<()>
+fn spinner() -> ProgressBar {
+    let s = ProgressBar::new_spinner();
+    s.enable_steady_tick(Duration::from_millis(100));
+    s
+}
+
+fn print_received(s: &Summary) {
+    println!("  {} {}", color("1;32", "✔"), describe(s, "Received"));
+    println!("  Saved: {}", s.names.join(", "));
+}
+
+/// `stay_open`: a receiver that keeps accepting transfers until Ctrl+C (which then ends normally).
+pub async fn run<F>(fut: F, receiving: bool, stay_open: bool) -> Result<()>
 where
     F: FnOnce(mpsc::UnboundedSender<Event>) -> std::pin::Pin<Box<dyn Future<Output = Result<Summary>> + Send>>,
 {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(fut(tx));
-    let spinner = ProgressBar::new_spinner();
-    spinner.enable_steady_tick(Duration::from_millis(100));
+    let mut spinner = spinner();
     let mut bar: Option<ProgressBar> = None;
+    let mut received = 0u32;
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
     loop {
         tokio::select! {
@@ -51,6 +63,11 @@ where
                 spinner.finish_and_clear();
                 if let Some(b) = &bar { b.abandon(); }
                 task.abort();
+                let _ = task.await; // runs the receiver's cleanup (frees its code in the mailbox)
+                if stay_open && bar.is_none() {
+                    println!("  Stopped after {received} transfer{}.", if received == 1 { "" } else { "s" });
+                    return Ok(());
+                }
                 anyhow::bail!("cancelled");
             }
             ev = rx.recv() => {
@@ -66,6 +83,10 @@ where
                             if browser {
                                 println!("  or send from a browser:");
                                 println!("      {}#{c}", crate::mailbox::WEB_URL);
+                            }
+                            if stay_open {
+                                println!();
+                                println!("  The code keeps working for more transfers until you press Ctrl+C.");
                             }
                             println!();
                         });
@@ -95,6 +116,14 @@ where
                         });
                         b.set_position(done.min(total));
                     }
+                    Event::Done(s) => {
+                        if let Some(b) = bar.take() { b.finish(); }
+                        spinner.finish_and_clear();
+                        print_received(&s);
+                        println!();
+                        received += 1;
+                        spinner = self::spinner();
+                    }
                 }
             }
         }
@@ -105,9 +134,10 @@ where
         if res.is_ok() { b.finish() } else { b.abandon() }
     }
     let s = res?;
-    println!("  {} {}", color("1;32", "✔"), describe(&s, if receiving { "Received" } else { "Sent" }));
     if receiving {
-        println!("  Saved: {}", s.names.join(", "));
+        print_received(&s);
+    } else {
+        println!("  {} {}", color("1;32", "✔"), describe(&s, "Sent"));
     }
     Ok(())
 }

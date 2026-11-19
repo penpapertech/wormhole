@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory() as w:
     open(f, "w").write("dropped via tui\n")
 
     # 1) CLI receiver, TUI sender
-    rx = subprocess.Popen([BIN, "receive"], cwd=dst, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    rx = subprocess.Popen([BIN, "receive", "--once"], cwd=dst, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     line = b""
     while not CODE_RE.search(line):
         line += rx.stdout.readline()

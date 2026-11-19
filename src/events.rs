@@ -22,6 +22,8 @@ pub enum Event {
     Connected { peer: SocketAddr, lan: bool },
     Offer(Offer),
     Progress { done: u64, total: u64 },
+    /// A receiver that stays open finished one transfer and is waiting for the next.
+    Done(Summary),
 }
 
 pub type Tx = UnboundedSender<Event>;

@@ -115,7 +115,16 @@ impl Mailbox {
         }
     }
 
-    pub async fn release(&self, nameplate: u32) {
-        let _ = self.call(json!({"op": "release", "np": nameplate.to_string()})).await;
+    pub async fn release(&self, nameplate: u32) -> Result<()> {
+        let (st, v) = self.call(json!({"op": "release", "np": nameplate.to_string()})).await?;
+        if st != 200 {
+            return Err(anyhow!("mailbox error {st}: {v}"));
+        }
+        Ok(())
+    }
+
+    /// For use in `Drop`, where we can't await: frees the nameplate, blocking briefly.
+    pub fn release_blocking(&self, nameplate: u32) {
+        let _ = self.agent.post(&self.url).send_json(json!({"op": "release", "np": nameplate.to_string()}));
     }
 }

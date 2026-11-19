@@ -54,7 +54,7 @@ function bg(cmd, args, opts = {}) {
 const strip = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
 async function startReceiver(dir) {
-  const p = bg(BIN, ["receive"], { cwd: dir, env: { ...process.env, WORMHOLE_MAILBOX: MAILBOX } });
+  const p = bg(BIN, ["receive", "--once"], { cwd: dir, env: { ...process.env, WORMHOLE_MAILBOX: MAILBOX } });
   for (let i = 0; i < 100; i++) {
     const m = /(\d+-[a-z]+-[a-z]+)/.exec(strip(p.out));
     if (m) return { p, code: m[1] };

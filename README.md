@@ -1,6 +1,6 @@
 # wormhole
 
-Send files and folders between two computers using a short one-time code. It works even when both
+Send files and folders between two computers using a short code. It works even when both
 computers are behind NAT. Everything ships as **one self-contained binary** for macOS and Linux.
 
 ```
@@ -10,6 +10,8 @@ computer A $ wormhole receive
       wormhole send 42-maple-sunset <files…>
   or send from a browser:
       https://penpapertech.github.io/wormhole/#42-maple-sunset
+
+  The code keeps working for more transfers until you press Ctrl+C.
 
 computer B $ wormhole send 42-maple-sunset -R *
   Connected to 81.2.69.160:52811 (direct over the internet)
@@ -27,8 +29,8 @@ computer B $ wormhole send 42-maple-sunset -R *
   the fly into the receiver's current folder. Existing files are never overwritten (`a.txt`
   becomes `a (1).txt`).
 - **Secure with a short code.** SPAKE2 (a password-authenticated key exchange) turns the
-  `42-maple-sunset` code into a strong key, bound to the TLS session. An attacker gets one guess,
-  and a failed guess aborts the transfer.
+  `42-maple-sunset` code into a strong key, bound to the TLS session. Each connection attempt is
+  one guess at the code, and a wrong guess is rejected (see [Staying open](#staying-open)).
 - **TUI or CLI.** Run `wormhole` with no arguments for an interactive UI where you can drag and
   drop files onto the terminal window, or script it with `receive` and `send`.
 - **Works in a browser too.** The [web page](https://penpapertech.github.io/wormhole/) can send to
@@ -133,7 +135,8 @@ install commands (`latest` always points at the newest release), and to uninstal
 | Command | What it does |
 |---|---|
 | `wormhole` | Interactive TUI: *Receive* shows a code; *Send* lets you type the code and drag files in |
-| `wormhole receive` (`r`) | Print a code, wait, save into the current folder (`-o DIR` to choose) |
+| `wormhole receive` (`r`) | Print a code and save everything sent with it into the current folder (`-o DIR` to choose), until Ctrl+C |
+| `wormhole receive --once` | Stop after one transfer (the code then stops working) |
 | `wormhole send CODE FILE…` (`s`) | Send files; add `-R` for folders, e.g. `wormhole send CODE -R *` |
 | `wormhole send CODE` | Open the TUI send screen with the code filled in, then drop files |
 | [web page](https://penpapertech.github.io/wormhole/) | Send from a browser, or open *Receive* to get a code there (`wormhole send CODE …` works with it) |
@@ -145,6 +148,20 @@ Options and environment variables:
 - `WORMHOLE_ZSTD_LEVEL` sets the compression level (default 3, range 1–19).
 - `wormhole receive --no-webrtc` doesn't offer the browser transport.
 - The web page accepts `?mailbox=URL` and `?stun=host:port` for self-hosting.
+
+### Staying open
+
+`wormhole receive` keeps running and accepts any number of transfers with the same code, one at a
+time, until you press Ctrl+C. That makes it usable as a drop box on a server: start it once
+(for example in `tmux` or as a service) and send to it whenever you like. The code doesn't expire
+while it runs; Ctrl+C frees it.
+
+The trade-off: the code works like a password for as long as the receiver runs, so anyone who
+learns it can send you files (they can't read anything from you). To slow down guessing, each wrong
+code makes the receiver pause before accepting the next connection: 1 s, then 2 s, 4 s, … up to
+10 minutes, resetting after a successful transfer. That keeps a mistyped code cheap but makes
+guessing the 67,081 word pairs take months. Use `--once` for the classic behaviour: one transfer,
+then the code is gone, and a wrong guess ends it.
 
 ## How it works
 
@@ -163,7 +180,8 @@ Options and environment variables:
 1. Each side binds a single UDP socket and asks STUN servers for its public address.
 2. The receiver claims a random **nameplate** (the number in the code) in the mailbox and posts
    its candidate addresses, both LAN and public. The sender looks the nameplate up and posts its
-   own. The mailbox entry expires after 30 minutes and is deleted once the peers connect.
+   own. The mailbox entry expires after 30 minutes and is deleted once the peers connect. A receiver
+   that stays open renews it every 10 minutes and re-posts fresh addresses after each transfer.
 3. Both sides send small probe packets to each other's candidates. The outgoing packets open the
    NAT mappings, and the first probe that gets through settles the address. On a LAN, a
    broadcast/multicast query on UDP port 47807 finds the receiver directly.
@@ -234,7 +252,9 @@ WORMHOLE_MAILBOX_URL=<url> cargo build --release   # bake it in as the default
 ```
 
 **Cost:** it stays within the AWS always-free tier for normal use. Each transfer makes a handful
-of Lambda calls, and the receiver polls about once a second while waiting. The table uses small
+of Lambda calls, and the receiver polls while waiting: every second at first, every 3 s after
+2 minutes and every 10 s after 10 minutes. A receiver left running for a month makes about 260,000
+calls, so a few of them fit in Lambda's free million requests a month. The table uses small
 *provisioned* capacity (10 RCU / 5 WCU, inside the free 25/25), so if someone hammers the public
 endpoint, DynamoDB throttles instead of billing more. Logs are kept for 3 days.
 
@@ -247,6 +267,7 @@ For testing you can run the same code locally with an in-memory store:
 cargo test                               # unit tests (codes, STUN parsing, tar/zstd roundtrip, path safety, drag & drop parsing)
 tests/local_e2e.sh                       # two processes on one machine, local mailbox, 300+ files
 MAILBOX=off tests/local_e2e.sh           # LAN discovery only
+tests/keep_open_e2e.sh                   # one receiver, several transfers with one code, wrong code, renewal, Ctrl+C
 python3 tests/tui_smoke.py target/release/wormhole   # drives the TUI through a pty (paste/drop, send & receive)
 
 web/build.sh && (cd tests/browser && npm install)    # once, for the browser tests

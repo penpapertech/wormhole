@@ -167,7 +167,7 @@ impl App {
         let (tx, rx) = mpsc::unbounded_channel();
         let opts = self.opts.clone();
         let task = if receiving {
-            self.handle.spawn(session::receive(opts, PathBuf::from("."), tx))
+            self.handle.spawn(session::receive(opts, PathBuf::from("."), true, tx))
         } else {
             let code = self.code_input.trim().to_string();
             let files = self.files.clone();
@@ -212,6 +212,7 @@ impl App {
                     run.progress = (done.min(total), total);
                     run.status = if run.receiving { "Receiving…" } else { "Sending…" }.into();
                 }
+                Event::Done(_) => {} // only receivers that stay open emit this; the TUI's don't
             }
         }
         if run.task.as_ref().is_some_and(|t| t.is_finished()) {

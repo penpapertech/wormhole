@@ -31,7 +31,7 @@ const ACK: &[u8; 4] = b"WHK1";
 const LAN_Q: &[u8; 4] = b"WHQ1";
 const LAN_A: &[u8; 4] = b"WHA1";
 
-/// How long a receiver waits for a sender before giving up.
+/// How long a one-shot receiver waits for a sender before giving up (the mailbox entry expires).
 pub const RECEIVER_WAIT: Duration = Duration::from_secs(30 * 60);
 /// How long a sender tries to punch through once it knows the receiver's addresses.
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(25);
@@ -110,6 +110,11 @@ fn info(candidates: &[SocketAddr]) -> PeerInfo {
     PeerInfo { v: 1, addrs: candidates.iter().map(|a| a.to_string()).collect(), webrtc: None }
 }
 
+/// What a receiver posts in the mailbox: its QUIC candidates and, optionally, a WebRTC offer.
+pub fn receiver_info(prep: &Prepared, webrtc_offer: Option<String>) -> PeerInfo {
+    PeerInfo { webrtc: webrtc_offer, ..info(&prep.candidates) }
+}
+
 /// Aborts the wrapped task when dropped.
 pub struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
 
@@ -135,8 +140,17 @@ pub fn spawn_sender_poller(mb: Mailbox, np: u32) -> (watch::Receiver<Option<Peer
                     }
                 });
             }
-            // Poll quickly at first, then back off to keep the mailbox cheap.
-            let secs = if started.elapsed() < Duration::from_secs(120) { 1 } else { 3 };
+            // Poll quickly at first, then back off to keep the mailbox cheap: a receiver that stays
+            // open for days settles at 10 s (~260k calls a month). Senders keep trying for 25-30 s,
+            // so they are still seen in time.
+            let waited = started.elapsed();
+            let secs = if waited < Duration::from_secs(120) {
+                1
+            } else if waited < Duration::from_secs(600) {
+                3
+            } else {
+                10
+            };
             tokio::time::sleep(Duration::from_secs(secs)).await;
         }
     });
@@ -173,14 +187,7 @@ pub(crate) fn is_lan_addr(a: &SocketAddr) -> bool {
 }
 
 /// Receiver side: claim a nameplate and return the code to show the user.
-pub async fn claim_code(
-    prep: &Prepared,
-    webrtc_offer: Option<String>,
-    mailbox: Option<&Mailbox>,
-    tx: &Tx,
-) -> Result<(Code, bool)> {
-    let mut pi = info(&prep.candidates);
-    pi.webrtc = webrtc_offer;
+pub async fn claim_code(pi: &PeerInfo, mailbox: Option<&Mailbox>, tx: &Tx) -> Result<(Code, bool)> {
     if let Some(mb) = mailbox {
         status(tx, "Registering with the rendezvous mailbox…");
         let mut digits = 999u32;
@@ -189,7 +196,7 @@ pub async fn claim_code(
                 digits = 9999;
             }
             let np = rand::Rng::gen_range(&mut rand::thread_rng(), 1..=digits);
-            match mb.claim(np, &pi).await {
+            match mb.claim(np, pi).await {
                 Ok(Claim::Claimed) => return Ok((Code::generate(np), true)),
                 Ok(Claim::Taken) => continue,
                 Err(e) => {
@@ -236,11 +243,13 @@ async fn lan_responder(listener: UdpSocket, main: Arc<UdpSocket>, lan_id: [u8; 1
     }
 }
 
-/// Receiver: wait until a sender reaches us, then return a QUIC endpoint + connection.
+/// Receiver: wait until a sender reaches us (at most `wait`), then return a QUIC endpoint +
+/// connection.
 pub async fn receiver_connect(
     prep: Prepared,
     code: &Code,
     sender_info: Option<watch::Receiver<Option<PeerInfo>>>,
+    wait: Option<Duration>,
     tx: &Tx,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let sock = Arc::new(prep.sock);
@@ -263,7 +272,8 @@ pub async fn receiver_connect(
     };
 
     let result = async {
-        let deadline = tokio::time::sleep(RECEIVER_WAIT);
+        // Duration::MAX is clamped by tokio to "far in the future".
+        let deadline = tokio::time::sleep(wait.unwrap_or(Duration::MAX));
         tokio::pin!(deadline);
         let mut tick = tokio::time::interval(Duration::from_millis(150));
         let mut buf = [0u8; 1500];

@@ -710,7 +710,7 @@ mod tests {
     #[test]
     fn directory_needs_recursive() {
         let src = tmpdir("norec");
-        assert!(plan(&[src.clone()], false).is_err());
+        assert!(plan(std::slice::from_ref(&src), false).is_err());
         fs::remove_dir_all(src).unwrap();
     }
 

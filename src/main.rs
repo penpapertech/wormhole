@@ -30,19 +30,24 @@ struct Cli {
 const EXAMPLES: &str = "\
 Examples:
   wormhole                            interactive TUI (receive, or drag & drop files to send)
-  wormhole receive                    print a code and wait; files land in the current folder
+  wormhole receive                    print a code and keep receiving into the current folder
+                                      with that code until Ctrl+C (--once: stop after one)
   wormhole send 7-purple-sausage a.pdf
   wormhole send 7-purple-sausage -R *  send everything here, including folders
   wormhole send 7-purple-sausage      open the TUI to drag & drop files";
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for files: prints a code to give to the sender.
+    /// Wait for files: prints a code to give to senders. Keeps accepting transfers with the same
+    /// code until Ctrl+C.
     #[command(visible_alias = "r", alias = "recv")]
     Receive {
         /// Directory to save into.
         #[arg(short, long, default_value = ".")]
         out: PathBuf,
+        /// Exit after one transfer, and let the code expire (after 30 minutes) if nobody sends.
+        #[arg(long)]
+        once: bool,
         /// Don't accept browser (WebRTC) senders.
         #[arg(long)]
         no_webrtc: bool,
@@ -76,12 +81,13 @@ fn main() -> Result<()> {
             let res = rt.block_on(cli::run(
                 move |tx| Box::pin(session::send(opts, code, files, recursive, tx)),
                 false,
+                false,
             ));
             exit_on_err(res)
         }
-        Some(Cmd::Receive { out, no_webrtc }) => {
+        Some(Cmd::Receive { out, once, no_webrtc }) => {
             opts.no_webrtc = no_webrtc;
-            let res = rt.block_on(cli::run(move |tx| Box::pin(session::receive(opts, out, tx)), true));
+            let res = rt.block_on(cli::run(move |tx| Box::pin(session::receive(opts, out, once, tx)), true, !once));
             exit_on_err(res)
         }
     }

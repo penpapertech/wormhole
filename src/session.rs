@@ -4,10 +4,11 @@ use crate::auth::{self, WRONG_CODE};
 use crate::code::Code;
 use crate::connect;
 use crate::events::{emit, status, Event, Summary, Tx};
-use crate::mailbox::Mailbox;
+use crate::mailbox::{Claim, Mailbox, PeerInfo};
 use crate::transfer;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Debug, Default)]
@@ -39,68 +40,201 @@ impl Options {
     }
 }
 
-pub async fn receive(opts: Options, dest: PathBuf, tx: Tx) -> Result<Summary> {
-    let mailbox = opts.mailbox();
-    // Browsers can only reach us through the mailbox, so WebRTC needs it. Both transports gather
-    // their addresses (STUN) in parallel.
-    let want_web = mailbox.is_some() && !opts.no_webrtc;
-    let (prep, web) = tokio::join!(connect::prepare(&tx, mailbox.is_some()), async {
-        if want_web { Some(crate::webrtc::prepare(true).await) } else { None }
-    });
-    let prep = prep?;
-    let web = match web {
-        Some(Ok(w)) => Some(w),
-        Some(Err(e)) => {
-            crate::events::warn(&tx, format!("Browser senders unavailable: {e:#}"));
-            None
-        }
-        None => None,
-    };
-    let offer_sdp = web.as_ref().map(|w| w.offer_sdp.clone());
-    let (code, online) = connect::claim_code(&prep, offer_sdp, mailbox.as_ref(), &tx).await?;
-    emit(&tx, Event::Code { code: code.to_string(), browser: online && web.is_some() });
-    if !online {
-        status(&tx, "Mailbox unavailable: the sender must be on the same local network.");
-    }
-    status(&tx, "Waiting for the sender…");
+/// While waiting, the mailbox entry is renewed this often (it expires after 30 minutes).
+/// WORMHOLE_TEST_RENEW_SECS shortens it for tests.
+fn renew_every() -> Duration {
+    let secs = std::env::var("WORMHOLE_TEST_RENEW_SECS").ok().and_then(|v| v.parse().ok());
+    Duration::from_secs(secs.unwrap_or(10 * 60))
+}
+/// Longest pause after repeated wrong-code attempts on a receiver that stays open.
+const MAX_LOCKOUT: Duration = Duration::from_secs(10 * 60);
 
-    let poller = match (&mailbox, online) {
-        (Some(mb), true) => Some(connect::spawn_sender_poller(mb.clone(), code.nameplate)),
-        _ => None,
-    };
-    let sender_info = poller.as_ref().map(|(rx, _)| rx.clone());
+/// The receiver's nameplate in the mailbox. Freed on drop, so Ctrl+C doesn't leave it taken.
+struct Slot {
+    mb: Mailbox,
+    np: u32,
+    held: AtomicBool,
+}
 
-    let res = async {
-        let link = race(prep, web, &code, sender_info, &tx).await?;
-        drop(poller);
-        if let (true, Some(mb)) = (online, mailbox.clone()) {
-            let np = code.nameplate;
+impl Slot {
+    /// Free the nameplate without waiting (one-shot receivers do this once authenticated).
+    fn release_soon(&self) {
+        if self.held.swap(false, Ordering::SeqCst) {
+            let (mb, np) = (self.mb.clone(), self.np);
             tokio::spawn(async move { mb.release(np).await });
         }
-        status(&tx, "Authenticated.");
-        match link {
-            Link::Quic { endpoint, conn, mut send, mut recv } => {
-                let summary = transfer::receive(&conn, &mut send, &mut recv, &dest, &tx).await?;
-                let _ = send.finish();
-                // Let the sender read our confirmation and close the connection.
-                let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-                endpoint.close(0u32.into(), b"done");
-                Ok(summary)
+    }
+
+    /// Point the nameplate at `info` (a new round's addresses), clearing any old sender entry.
+    /// Mailbox outages are retried; only losing the nameplate to someone else is an error.
+    async fn register(&self, info: &PeerInfo, tx: &Tx) -> Result<()> {
+        let mut delay = 2;
+        loop {
+            let res = async {
+                self.mb.release(self.np).await?;
+                self.mb.claim(self.np, info).await
             }
-            Link::Web(mut dc) => {
-                let summary = transfer::receive_dc(&mut dc, &dest, &tx).await;
-                dc.close().await;
-                summary
+            .await;
+            match res {
+                Ok(Claim::Claimed) => {
+                    self.held.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Ok(Claim::Taken) => bail!(
+                    "another receiver took this code's number while it was being renewed; \
+                     restart to get a new code"
+                ),
+                Err(e) => {
+                    crate::events::warn(tx, format!("{e:#}; retrying in {delay}s"));
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay * 2).min(60);
+                }
             }
         }
     }
-    .await;
-    if res.is_err() && online {
-        if let Some(mb) = &mailbox {
-            mb.release(code.nameplate).await;
+
+    /// Keep the entry from expiring. Returns only if the nameplate is lost.
+    async fn keep_alive(&self, info: &PeerInfo, connected: &AtomicBool, tx: &Tx) -> anyhow::Error {
+        let mut skipped = false;
+        loop {
+            tokio::time::sleep(renew_every()).await;
+            // Renewing clears the sender's entry, so don't do it while a sender is still connecting
+            // (but only skip once: an entry that is still there next time is stale).
+            if !connected.load(Ordering::SeqCst) && !skipped {
+                if let Ok(Some((_, Some(_)))) = self.mb.get(self.np).await {
+                    skipped = true;
+                    continue;
+                }
+            }
+            skipped = false;
+            if let Err(e) = self.register(info, tx).await {
+                return e;
+            }
         }
     }
-    res
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if self.held.load(Ordering::SeqCst) {
+            self.mb.release_blocking(self.np);
+        }
+    }
+}
+
+/// Receive files into `dest`. With `once`, return after one transfer; otherwise keep accepting
+/// transfers with the same code until cancelled, emitting `Event::Done` after each.
+pub async fn receive(opts: Options, dest: PathBuf, once: bool, tx: Tx) -> Result<Summary> {
+    let mailbox = opts.mailbox();
+    // Browsers can only reach us through the mailbox, so WebRTC needs it.
+    let want_web = mailbox.is_some() && !opts.no_webrtc;
+    let mut code: Option<Code> = None;
+    let mut slot: Option<Slot> = None; // None: local network only
+    let mut wrong = 0u32;
+    let mut first = true;
+    loop {
+        // Each round gets fresh sockets and a fresh WebRTC offer; both gather (STUN) in parallel.
+        let (prep, web) = tokio::join!(connect::prepare(&tx, mailbox.is_some()), async {
+            if want_web { Some(crate::webrtc::prepare(true).await) } else { None }
+        });
+        let prep = prep?;
+        let web = match web {
+            Some(Ok(w)) => Some(w),
+            Some(Err(e)) => {
+                crate::events::warn(&tx, format!("Browser senders unavailable: {e:#}"));
+                None
+            }
+            None => None,
+        };
+        let info = connect::receiver_info(&prep, web.as_ref().map(|w| w.offer_sdp.clone()));
+        let code = match (&code, &slot) {
+            (Some(c), Some(sl)) => {
+                sl.register(&info, &tx).await?;
+                c.clone()
+            }
+            (Some(c), None) => c.clone(),
+            (None, _) => {
+                let (c, online) = connect::claim_code(&info, mailbox.as_ref(), &tx).await?;
+                emit(&tx, Event::Code { code: c.to_string(), browser: online && web.is_some() });
+                if online {
+                    let mb = mailbox.clone().expect("online implies a mailbox");
+                    slot = Some(Slot { mb, np: c.nameplate, held: AtomicBool::new(true) });
+                } else {
+                    status(&tx, "Mailbox unavailable: the sender must be on the same local network.");
+                }
+                code.insert(c).clone()
+            }
+        };
+        status(&tx, if first { "Waiting for the sender…" } else { "Waiting for the next sender…" });
+        first = false;
+
+        let poller = slot.as_ref().map(|s| connect::spawn_sender_poller(s.mb.clone(), s.np));
+        let sender_info = poller.as_ref().map(|(rx, _)| rx.clone());
+        let connected = AtomicBool::new(false);
+        let round = async {
+            let wait = once.then_some(connect::RECEIVER_WAIT);
+            let link = race(prep, web, &code, sender_info, wait, &tx).await?;
+            drop(poller);
+            connected.store(true, Ordering::SeqCst);
+            if once {
+                if let Some(sl) = &slot {
+                    sl.release_soon();
+                }
+            }
+            status(&tx, "Authenticated.");
+            match link {
+                Link::Quic { endpoint, conn, mut send, mut recv } => {
+                    let summary = transfer::receive(&conn, &mut send, &mut recv, &dest, &tx).await?;
+                    let _ = send.finish();
+                    // Let the sender read our confirmation and close the connection.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+                    endpoint.close(0u32.into(), b"done");
+                    Ok(summary)
+                }
+                Link::Web(mut dc) => {
+                    let summary = transfer::receive_dc(&mut dc, &dest, &tx).await;
+                    dc.close().await;
+                    summary
+                }
+            }
+        };
+        let renew = async {
+            match &slot {
+                Some(sl) if !once => sl.keep_alive(&info, &connected, &tx).await,
+                _ => std::future::pending().await,
+            }
+        };
+        let res = tokio::select! {
+            r = round => r,
+            e = renew => return Err(e),
+        };
+        if once {
+            return res; // dropping `slot` frees the nameplate if it is still held
+        }
+        match res {
+            Ok(summary) => {
+                wrong = 0;
+                emit(&tx, Event::Done(summary));
+            }
+            Err(e) if is_auth_failure(&e) => {
+                // The code never changes, so each wrong guess costs the guesser more time.
+                wrong += 1;
+                let pause = Duration::from_secs(1u64 << (wrong - 1).min(10)).min(MAX_LOCKOUT);
+                crate::events::warn(
+                    &tx,
+                    format!(
+                        "A sender used the wrong code ({wrong} in a row); not accepting connections for {}s.",
+                        pause.as_secs()
+                    ),
+                );
+                tokio::time::sleep(pause).await;
+            }
+            Err(e) => {
+                crate::events::warn(&tx, format!("Transfer failed: {e:#}"));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 /// Wait on both transports; the first sender to authenticate wins. A wrong code on either one
@@ -109,11 +243,12 @@ async fn race(
     prep: connect::Prepared,
     web: Option<crate::webrtc::Prepared>,
     code: &Code,
-    sender_info: Option<tokio::sync::watch::Receiver<Option<crate::mailbox::PeerInfo>>>,
+    sender_info: Option<tokio::sync::watch::Receiver<Option<PeerInfo>>>,
+    wait: Option<Duration>,
     tx: &Tx,
 ) -> Result<Link> {
     let quic = async {
-        let (endpoint, conn) = connect::receiver_connect(prep, code, sender_info.clone(), tx).await?;
+        let (endpoint, conn) = connect::receiver_connect(prep, code, sender_info.clone(), wait, tx).await?;
         let (mut send, mut recv) = conn.accept_bi().await.context("waiting for the sender")?;
         if let Err(e) = auth::authenticate(&conn, &mut send, &mut recv, code, false).await {
             conn.close(1u32.into(), b"bad code");
@@ -191,7 +326,7 @@ pub async fn send(opts: Options, code: String, paths: Vec<PathBuf>, recursive: b
 async fn send_webrtc(mb: &Mailbox, code: &Code, offer: &str, plan: transfer::Plan, tx: &Tx) -> Result<Summary> {
     status(tx, "The receiver is a web browser; connecting over WebRTC…");
     let a = crate::webrtc::answer(offer, true).await?;
-    let info = crate::mailbox::PeerInfo { v: 1, addrs: vec![], webrtc: Some(a.answer_sdp.clone()) };
+    let info = PeerInfo { v: 1, addrs: vec![], webrtc: Some(a.answer_sdp.clone()) };
     if !mb.put_sender(code.nameplate, &info).await? {
         anyhow::bail!("no receiver is waiting for code {code} (it may have expired)");
     }

@@ -22,6 +22,8 @@ jobs:
         run: tests/local_e2e.sh target/release/wormhole
       - name: End-to-end (LAN discovery only)
         run: MAILBOX=off tests/local_e2e.sh target/release/wormhole
+      - name: End-to-end (receiver that stays open)
+        run: tests/keep_open_e2e.sh target/release/wormhole
 
   browser-and-nat:
     runs-on: ubuntu-latest

@@ -23,7 +23,7 @@ head -c 30000000 /dev/urandom > "$W/src/tree/deep/er/random.bin"
 for i in $(seq 1 300); do echo "file $i" > "$W/src/tree/deep/small_$i.txt"; done
 echo "pre-existing" > "$W/dst/hello.txt"
 
-(cd "$W/dst" && "$BIN" receive > "$W/recv.log" 2>&1) &
+(cd "$W/dst" && "$BIN" receive --once > "$W/recv.log" 2>&1) &
 RPID=$!
 for _ in $(seq 1 50); do
   CODE=$(grep -oE '[0-9]+-[a-z]+-[a-z]+' "$W/recv.log" | head -1 || true)
