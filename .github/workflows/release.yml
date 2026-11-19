@@ -58,3 +58,33 @@ jobs:
         with:
           files: wormhole-*
           generate_release_notes: true
+
+  # Points penpapertech/homebrew-tap at this release. Needs the HOMEBREW_TAP_TOKEN secret: a
+  # fine-grained token with Contents read/write on penpapertech/homebrew-tap only. Without it the
+  # job only warns, and the formula can be updated by hand with scripts/homebrew-formula.sh.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Update the formula
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::HOMEBREW_TAP_TOKEN is not set; the Homebrew formula was not updated."
+            exit 0
+          fi
+          git clone -q "https://x-access-token:$TOKEN@github.com/penpapertech/homebrew-tap.git" tap
+          scripts/homebrew-formula.sh "${TAG#v}" dist > tap/Formula/wormhole.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then echo "Formula already up to date."; exit 0; fi
+          git commit -qam "wormhole ${TAG#v}"
+          git push -q origin HEAD

@@ -39,6 +39,17 @@ computer B $ wormhole send 42-maple-sunset -R *
 
 ## Install
 
+### Homebrew (macOS and Linux)
+
+```sh
+brew install penpapertech/tap/wormhole
+```
+
+Update with `brew upgrade`. Use the full name: a plain `brew install wormhole` installs an
+unrelated app with the same name. Homebrew installs skip the macOS "unidentified developer" warning.
+
+### Manual download
+
 Prebuilt binaries are on the [Releases](https://github.com/penpapertech/wormhole/releases) page.
 Each is a single file with no dependencies. Pick your platform:
 
@@ -52,7 +63,7 @@ Each is a single file with no dependencies. Pick your platform:
 Not sure which one? Run `uname -sm`: `Darwin arm64` is Apple Silicon, `Darwin x86_64` is an
 Intel Mac, `Linux x86_64` is Linux x86_64, `Linux aarch64` is Linux ARM64.
 
-### macOS
+#### macOS
 
 ```sh
 # Apple Silicon (use wormhole-macos-x86_64 on an Intel Mac)
@@ -72,7 +83,7 @@ xattr -d com.apple.quarantine /usr/local/bin/wormhole
 The first time it runs, macOS may ask to let your terminal access the local network. Allow it;
 it's needed to find the other computer when both are on the same Wi-Fi.
 
-### Linux
+#### Linux
 
 ```sh
 # x86_64 (use wormhole-linux-aarch64 on ARM64)
@@ -85,7 +96,7 @@ The Linux builds are statically linked (musl), so they run on any distribution, 
 and old glibc systems. If `wormhole` isn't found, add `~/.local/bin` to your `PATH`, or move the
 binary to `/usr/local/bin` with `sudo` instead.
 
-### Verify the download (optional)
+#### Verify the download (optional)
 
 Each archive has a `.sha256` file next to it:
 
@@ -113,8 +124,8 @@ This puts `wormhole` in `~/.cargo/bin`.
 
 ### Updating and uninstalling
 
-To update, repeat the install commands; `latest` always points at the newest release. To
-uninstall, delete the binary (`/usr/local/bin/wormhole`, `~/.local/bin/wormhole` or
+With Homebrew, `brew upgrade` and `brew uninstall wormhole`. Otherwise, to update, repeat the
+install commands (`latest` always points at the newest release), and to uninstall, delete the binary (`/usr/local/bin/wormhole`, `~/.local/bin/wormhole` or
 `~/.cargo/bin/wormhole`). wormhole keeps no config files or caches.
 
 ## Usage
