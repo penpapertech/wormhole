@@ -2,6 +2,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: # dry run: builds and signs, but only a tag publishes a release
 
 permissions:
   contents: write
@@ -25,6 +26,15 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
+      # Ad-hoc signature (no identity): Apple Silicon refuses unsigned code, and the linker only
+      # signs arm64 on its own. It does not satisfy Gatekeeper; that needs a Developer ID + notarization.
+      - name: Ad-hoc sign (macOS)
+        if: contains(matrix.target, 'apple')
+        run: |
+          bin=target/${{ matrix.target }}/release/wormhole
+          codesign --force --sign - "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+          codesign --display --verbose=2 "$bin" 2>&1 | grep -E 'Identifier|Format|Signature'
       - name: Package
         run: |
           mkdir dist
@@ -38,6 +48,7 @@ jobs:
 
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
